@@ -68,6 +68,37 @@ static CBMFileResult *extract(const char *src, CBMLanguage lang, const char *pro
  * Group A: OOP Languages
  * ═══════════════════════════════════════════════════════════════════ */
 
+/* --- R: box::use imports (#218) + module$fn calls (#219) --- */
+TEST(extract_r_box_use_imports_issue218) {
+    CBMFileResult *r = extract("box::use(\n"
+                               "  shiny[moduleServer, NS],\n"
+                               "  app/logic/validation[validate_input],\n"
+                               ")\n"
+                               "library(dplyr)\n"
+                               "source(\"helpers.R\")\n",
+                               CBM_LANG_R, "t", "app.R");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* box::use specs → one IMPORTS edge per module (symbol list stripped). */
+    ASSERT(has_import(r, "shiny"));
+    ASSERT(has_import(r, "app/logic/validation"));
+    /* base-R imports work too. */
+    ASSERT(has_import(r, "dplyr"));
+    ASSERT(has_import(r, "helpers"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_r_dollar_call_issue219) {
+    CBMFileResult *r = extract("validation$validate_input(x)\n", CBM_LANG_R, "t", "app.R");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* module$fn() now produces a CALLS edge (was silently dropped). */
+    ASSERT(has_call(r, "validation.validate_input"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Java --- */
 TEST(java_class) {
     CBMFileResult *r = extract(
@@ -111,9 +142,9 @@ TEST(java_interface) {
  *      was emitted, the interfaces were dropped.
  *   2) the emitted name was the full field text including the keyword. */
 TEST(java_class_extends_and_implements) {
-    CBMFileResult *r = extract(
-        "public class DefaultLinkTool extends DefaultDiagramTool implements ILinkTool, Closeable { }",
-        CBM_LANG_JAVA, "t", "DefaultLinkTool.java");
+    CBMFileResult *r = extract("public class DefaultLinkTool extends DefaultDiagramTool implements "
+                               "ILinkTool, Closeable { }",
+                               CBM_LANG_JAVA, "t", "DefaultLinkTool.java");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
 
@@ -137,9 +168,12 @@ TEST(java_class_extends_and_implements) {
          * "implements ..." literally inside one of the entries. */
         ASSERT_NULL(strstr(*b, "extends"));
         ASSERT_NULL(strstr(*b, "implements"));
-        if (strcmp(*b, "DefaultDiagramTool") == 0) saw_super = true;
-        if (strcmp(*b, "ILinkTool") == 0) saw_iface_a = true;
-        if (strcmp(*b, "Closeable") == 0) saw_iface_b = true;
+        if (strcmp(*b, "DefaultDiagramTool") == 0)
+            saw_super = true;
+        if (strcmp(*b, "ILinkTool") == 0)
+            saw_iface_a = true;
+        if (strcmp(*b, "Closeable") == 0)
+            saw_iface_b = true;
     }
     ASSERT_TRUE(saw_super);
     ASSERT_TRUE(saw_iface_a);
@@ -800,8 +834,8 @@ TEST(swift_simple_call) {
 }
 
 TEST(swift_method_call) {
-    CBMFileResult *r = extract("class Foo {\n    func bar() { baz.run() }\n}\n", CBM_LANG_SWIFT,
-                               "t", "Foo.swift");
+    CBMFileResult *r =
+        extract("class Foo {\n    func bar() { baz.run() }\n}\n", CBM_LANG_SWIFT, "t", "Foo.swift");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_call(r, "baz.run"));
@@ -1730,10 +1764,10 @@ TEST(go_imports) {
 }
 
 TEST(java_imports) {
-    CBMFileResult *r =
-        extract("import java.util.List;\nimport java.util.ArrayList;\nimport static java.lang.Math.PI;\n"
-                "public class Foo {}\n",
-                CBM_LANG_JAVA, "t", "Foo.java");
+    CBMFileResult *r = extract(
+        "import java.util.List;\nimport java.util.ArrayList;\nimport static java.lang.Math.PI;\n"
+        "public class Foo {}\n",
+        CBM_LANG_JAVA, "t", "Foo.java");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_GT(r->imports.count, 0);
@@ -1743,10 +1777,10 @@ TEST(java_imports) {
 }
 
 TEST(rust_imports) {
-    CBMFileResult *r =
-        extract("use std::collections::HashMap;\nuse std::io::{self, Write};\nuse serde::Serialize;\n"
-                "fn main() {}\n",
-                CBM_LANG_RUST, "t", "main.rs");
+    CBMFileResult *r = extract(
+        "use std::collections::HashMap;\nuse std::io::{self, Write};\nuse serde::Serialize;\n"
+        "fn main() {}\n",
+        CBM_LANG_RUST, "t", "main.rs");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_GT(r->imports.count, 0);
@@ -1756,9 +1790,9 @@ TEST(rust_imports) {
 }
 
 TEST(c_imports) {
-    CBMFileResult *r =
-        extract("#include <stdio.h>\n#include <stdlib.h>\n#include \"mylib.h\"\n\nint main() { return 0; }\n",
-                CBM_LANG_C, "t", "main.c");
+    CBMFileResult *r = extract("#include <stdio.h>\n#include <stdlib.h>\n#include "
+                               "\"mylib.h\"\n\nint main() { return 0; }\n",
+                               CBM_LANG_C, "t", "main.c");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_GT(r->imports.count, 0);
@@ -1768,9 +1802,9 @@ TEST(c_imports) {
 }
 
 TEST(ruby_imports) {
-    CBMFileResult *r =
-        extract("require 'json'\nrequire 'net/http'\nrequire_relative 'helpers'\n\nclass Foo; end\n",
-                CBM_LANG_RUBY, "t", "app.rb");
+    CBMFileResult *r = extract(
+        "require 'json'\nrequire 'net/http'\nrequire_relative 'helpers'\n\nclass Foo; end\n",
+        CBM_LANG_RUBY, "t", "app.rb");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_GT(r->imports.count, 0);
@@ -1780,9 +1814,9 @@ TEST(ruby_imports) {
 }
 
 TEST(lua_imports) {
-    CBMFileResult *r =
-        extract("local json = require(\"dkjson\")\nlocal http = require(\"socket.http\")\n\nlocal function greet() end\n",
-                CBM_LANG_LUA, "t", "main.lua");
+    CBMFileResult *r = extract("local json = require(\"dkjson\")\nlocal http = "
+                               "require(\"socket.http\")\n\nlocal function greet() end\n",
+                               CBM_LANG_LUA, "t", "main.lua");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_GT(r->imports.count, 0);
@@ -1825,15 +1859,14 @@ TEST(import_stress_go) {
 
 TEST(svelte_imports_basic) {
     /* Default import + named imports + namespace import */
-    CBMFileResult *r = extract(
-        "<script>\n"
-        "import Foo from './Foo.svelte';\n"
-        "import { bar, baz } from '../lib/utils';\n"
-        "import * as helpers from './helpers';\n"
-        "export let value = 42;\n"
-        "</script>\n"
-        "<h1>Hello {value}</h1>\n",
-        CBM_LANG_SVELTE, "t", "Comp.svelte");
+    CBMFileResult *r = extract("<script>\n"
+                               "import Foo from './Foo.svelte';\n"
+                               "import { bar, baz } from '../lib/utils';\n"
+                               "import * as helpers from './helpers';\n"
+                               "export let value = 42;\n"
+                               "</script>\n"
+                               "<h1>Hello {value}</h1>\n",
+                               CBM_LANG_SVELTE, "t", "Comp.svelte");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_GTE(r->imports.count, 3);
@@ -1846,10 +1879,9 @@ TEST(svelte_imports_basic) {
 
 TEST(svelte_imports_no_script) {
     /* .svelte with no <script> block must not crash, 0 imports */
-    CBMFileResult *r = extract(
-        "<h1>Static page</h1>\n"
-        "<p>No script here.</p>\n",
-        CBM_LANG_SVELTE, "t", "Static.svelte");
+    CBMFileResult *r = extract("<h1>Static page</h1>\n"
+                               "<p>No script here.</p>\n",
+                               CBM_LANG_SVELTE, "t", "Static.svelte");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_EQ(r->imports.count, 0);
@@ -1859,14 +1891,13 @@ TEST(svelte_imports_no_script) {
 
 TEST(vue_imports_basic) {
     /* Vue SFC: same document→script_element→raw_text AST structure */
-    CBMFileResult *r = extract(
-        "<template><div>{{ msg }}</div></template>\n"
-        "<script>\n"
-        "import MyComp from './MyComp.vue';\n"
-        "import { ref } from 'vue';\n"
-        "export default { name: 'App' };\n"
-        "</script>\n",
-        CBM_LANG_VUE, "t", "App.vue");
+    CBMFileResult *r = extract("<template><div>{{ msg }}</div></template>\n"
+                               "<script>\n"
+                               "import MyComp from './MyComp.vue';\n"
+                               "import { ref } from 'vue';\n"
+                               "export default { name: 'App' };\n"
+                               "</script>\n",
+                               CBM_LANG_VUE, "t", "App.vue");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_GTE(r->imports.count, 2);
@@ -1878,15 +1909,14 @@ TEST(vue_imports_basic) {
 
 TEST(html_imports_basic) {
     /* Plain HTML with inline ES module imports — same generic walker. */
-    CBMFileResult *r = extract(
-        "<!DOCTYPE html><html><head>\n"
-        "<script type=\"module\">\n"
-        "import { renderApp } from './app.js';\n"
-        "import * as utils from './utils.js';\n"
-        "renderApp();\n"
-        "</script>\n"
-        "</head><body></body></html>\n",
-        CBM_LANG_HTML, "t", "index.html");
+    CBMFileResult *r = extract("<!DOCTYPE html><html><head>\n"
+                               "<script type=\"module\">\n"
+                               "import { renderApp } from './app.js';\n"
+                               "import * as utils from './utils.js';\n"
+                               "renderApp();\n"
+                               "</script>\n"
+                               "</head><body></body></html>\n",
+                               CBM_LANG_HTML, "t", "index.html");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_GTE(r->imports.count, 2);
@@ -2300,7 +2330,6 @@ TEST(extract_java_method_annotations_issue382) {
     PASS();
 }
 
-
 /* Issue #213: large TS files were indexed as a File node with zero children. */
 TEST(extract_large_ts_has_functions_issue213) {
     enum { NFUNCS = 4000 };
@@ -2309,9 +2338,9 @@ TEST(extract_large_ts_has_functions_issue213) {
     ASSERT_NOT_NULL(src);
     size_t off = 0;
     for (int i = 0; i < NFUNCS; i++) {
-        off += (size_t)snprintf(src + off, cap - off,
-                                "export function fn%d(a: number): number { return a + %d; }\n", i,
-                                i);
+        off +=
+            (size_t)snprintf(src + off, cap - off,
+                             "export function fn%d(a: number): number { return a + %d; }\n", i, i);
     }
     CBMFileResult *r =
         cbm_extract_file(src, (int)off, CBM_LANG_TYPESCRIPT, "t", "big.ts", 0, NULL, NULL);
@@ -2323,7 +2352,6 @@ TEST(extract_large_ts_has_functions_issue213) {
     PASS();
 }
 
-
 /* ═══════════════════════════════════════════════════════════════════
  * Suite
  * ═══════════════════════════════════════════════════════════════════ */
@@ -2331,6 +2359,10 @@ TEST(extract_large_ts_has_functions_issue213) {
 SUITE(extraction) {
     /* Initialize extraction library */
     cbm_init();
+
+    /* R box-module imports + member calls */
+    RUN_TEST(extract_r_box_use_imports_issue218);
+    RUN_TEST(extract_r_dollar_call_issue219);
 
     /* OOP */
     RUN_TEST(java_class);

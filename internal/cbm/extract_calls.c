@@ -163,6 +163,23 @@ static char *extract_callee_from_fields(CBMArena *a, TSNode node, const char *so
             strcmp(fk, "qualified_identifier") == 0) {
             return cbm_node_text(a, func_node, source);
         }
+        // R member call: module$fn() — function node is an extract_operator
+        // with lhs (object) and rhs (method). Emit "module.fn" so it resolves
+        // like other member calls (#219). Previously dropped → no CALLS edge.
+        if (strcmp(fk, "extract_operator") == 0) {
+            TSNode lhs = ts_node_child_by_field_name(func_node, TS_FIELD("lhs"));
+            TSNode rhs = ts_node_child_by_field_name(func_node, TS_FIELD("rhs"));
+            if (!ts_node_is_null(rhs)) {
+                char *rt = cbm_node_text(a, rhs, source);
+                if (!ts_node_is_null(lhs)) {
+                    char *lt = cbm_node_text(a, lhs, source);
+                    if (lt && lt[0] && rt && rt[0]) {
+                        return cbm_arena_sprintf(a, "%s.%s", lt, rt);
+                    }
+                }
+                return rt;
+            }
+        }
     }
 
     // Try "name" field (Java method_invocation)
