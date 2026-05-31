@@ -1088,6 +1088,10 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
 #endif
     agents.vscode = dir_exists(path);
 
+    /* Cursor stores its user MCP config in ~/.cursor/mcp.json on all platforms. */
+    snprintf(path, sizeof(path), "%s/.cursor", home_dir);
+    agents.cursor = dir_exists(path);
+
     snprintf(path, sizeof(path), "%s/.openclaw", home_dir);
     agents.openclaw = dir_exists(path);
 
@@ -2734,6 +2738,7 @@ static void print_detected_agents(const cbm_detected_agents_t *a) {
         {a->aider, "Aider"},
         {a->kilocode, "KiloCode"},
         {a->vscode, "VS-Code"},
+        {a->cursor, "Cursor"},
         {a->openclaw, "OpenClaw"},
         {a->kiro, "Kiro"},
     };
@@ -2923,6 +2928,12 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
 #endif
         install_generic_agent_config("VS Code", binary_path, cp, NULL, dry_run,
                                      cbm_install_vscode_mcp);
+    }
+    if (agents->cursor) {
+        char cp[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.cursor/mcp.json", home);
+        install_generic_agent_config("Cursor", binary_path, cp, NULL, dry_run,
+                                     cbm_install_editor_mcp);
     }
     if (agents->openclaw) {
         char cp[CLI_BUF_1K];
@@ -3243,6 +3254,12 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
 #endif
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"VS Code", cp, NULL}, dry_run,
                                   cbm_remove_vscode_mcp);
+    }
+    if (agents->cursor) {
+        char cp[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.cursor/mcp.json", home);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Cursor", cp, NULL}, dry_run,
+                                  cbm_remove_editor_mcp);
     }
     if (agents->openclaw) {
         char cp[CLI_BUF_1K];

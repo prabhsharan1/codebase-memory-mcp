@@ -1453,6 +1453,25 @@ TEST(cli_detect_agents_finds_codex) {
     PASS();
 }
 
+/* issue #222: Cursor (~/.cursor/) must be detected so install/update registers
+ * the MCP server in ~/.cursor/mcp.json — previously it was never discovered. */
+TEST(cli_detect_agents_finds_cursor_issue222) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-detect-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        SKIP("cbm_mkdtemp failed");
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/.cursor", tmpdir);
+    test_mkdirp(dir);
+
+    cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
+    ASSERT_TRUE(agents.cursor);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_detect_agents_finds_gemini) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-detect-XXXXXX");
@@ -1522,8 +1541,8 @@ TEST(cli_detect_agents_finds_kilocode) {
     snprintf(dir, sizeof(dir),
              "%s/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code", tmpdir);
 #elif defined(_WIN32)
-    snprintf(dir, sizeof(dir),
-             "%s/AppData/Roaming/Code/User/globalStorage/kilocode.kilo-code", tmpdir);
+    snprintf(dir, sizeof(dir), "%s/AppData/Roaming/Code/User/globalStorage/kilocode.kilo-code",
+             tmpdir);
 #else
     snprintf(dir, sizeof(dir), "%s/.config/Code/User/globalStorage/kilocode.kilo-code", tmpdir);
 #endif
@@ -2496,6 +2515,7 @@ SUITE(cli) {
     RUN_TEST(cli_detect_agents_finds_claude);
     RUN_TEST(cli_detect_agents_finds_claude_via_env);
     RUN_TEST(cli_detect_agents_finds_codex);
+    RUN_TEST(cli_detect_agents_finds_cursor_issue222);
     RUN_TEST(cli_detect_agents_finds_gemini);
     RUN_TEST(cli_detect_agents_finds_zed);
     RUN_TEST(cli_detect_agents_finds_antigravity);

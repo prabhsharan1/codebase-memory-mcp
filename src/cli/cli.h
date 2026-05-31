@@ -119,6 +119,7 @@ typedef struct {
     bool aider;       /* aider on PATH */
     bool kilocode;    /* KiloCode globalStorage dir exists */
     bool vscode;      /* VS Code User config dir exists */
+    bool cursor;      /* ~/.cursor/ exists */
     bool openclaw;    /* ~/.openclaw/ exists */
     bool kiro;        /* ~/.kiro/ exists */
 } cbm_detected_agents_t;
