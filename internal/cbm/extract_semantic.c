@@ -17,6 +17,26 @@ enum { MAX_EXCEPTION_NAME_LEN = 100, LAST_IDX = 1 };
 
 // --- Throw/Raise extraction ---
 
+// Detect whether a node is a throw node for the given spec.
+//
+// Kotlin special case: this grammar models `throw X(...)` as a `jump_expression`
+// (the same node also covers return/break/continue), NOT a `throw_expression`,
+// so the spec's throw_node_types ("throw_expression") never matches.  We treat a
+// Kotlin `jump_expression` as a throw only when its first child is the `throw`
+// keyword, which excludes return/break/continue without false positives.
+static bool is_throw_node(TSNode node, const CBMLangSpec *spec) {
+    if (cbm_kind_in_set(node, spec->throw_node_types)) {
+        return true;
+    }
+    if (spec->language == CBM_LANG_KOTLIN && strcmp(ts_node_type(node), "jump_expression") == 0) {
+        uint32_t nc = ts_node_child_count(node);
+        if (nc > 0 && strcmp(ts_node_type(ts_node_child(node, 0)), "throw") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Resolve exception name from the first meaningful child of a throw/raise node.
 static char *resolve_exception_name(CBMArena *a, TSNode throw_node, const char *source) {
     uint32_t nc = ts_node_child_count(throw_node);
@@ -86,7 +106,7 @@ static void extract_throws_clause(CBMExtractCtx *ctx, TSNode node, const CBMLang
 
 // Process a single node for throw extraction (called from iterative walker).
 static void process_throw_node(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
-    if (cbm_kind_in_set(node, spec->throw_node_types)) {
+    if (is_throw_node(node, spec)) {
         char *exc_name = resolve_exception_name(ctx->arena, node, ctx->source);
         if (exc_name && exc_name[0]) {
             if (strlen(exc_name) > MAX_EXCEPTION_NAME_LEN) {
@@ -187,7 +207,7 @@ void handle_throws(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
         return;
     }
 
-    if (has_throws && cbm_kind_in_set(node, spec->throw_node_types)) {
+    if (has_throws && is_throw_node(node, spec)) {
         char *exc_name = resolve_exception_name(ctx->arena, node, ctx->source);
         if (exc_name && exc_name[0]) {
             if (strlen(exc_name) > MAX_EXCEPTION_NAME_LEN) {

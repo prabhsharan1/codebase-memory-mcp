@@ -35,6 +35,9 @@ static void parse_haskell_imports(CBMExtractCtx *ctx);
 static void parse_zig_imports(CBMExtractCtx *ctx);
 static void parse_generic_imports(CBMExtractCtx *ctx, const char *node_type);
 static void parse_wolfram_imports(CBMExtractCtx *ctx);
+static void parse_php_imports(CBMExtractCtx *ctx);
+static void parse_csharp_imports(CBMExtractCtx *ctx);
+static void parse_spec_imports(CBMExtractCtx *ctx);
 
 // Helper: strip quotes from a string literal
 static char *strip_quotes(CBMArena *a, const char *s) {
@@ -48,18 +51,24 @@ static char *strip_quotes(CBMArena *a, const char *s) {
     return cbm_arena_strdup(a, s);
 }
 
-// Helper: get last path component as local name
+// Helper: get last path component as local name.
+// Recognizes every separator used across the supported import syntaxes:
+//   '/'  (Go / TS / JS paths), '.' (Java / Kotlin / C# / Python dotted names),
+//   '::' (Rust / C++ scope), '\\' (PHP namespaces).  The last separator of any
+//   kind wins, so "std::collections::HashMap" → "HashMap" and
+//   "App\\Http\\Controller" → "Controller".
 static const char *path_last(CBMArena *a, const char *path) {
     if (!path) {
         return NULL;
     }
-    const char *last = strrchr(path, '/');
-    if (last) {
-        return cbm_arena_strdup(a, last + SKIP_ONE);
+    const char *last_sep = NULL;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' || *p == '.' || *p == ':' || *p == '\\') {
+            last_sep = p;
+        }
     }
-    last = strrchr(path, '.');
-    if (last) {
-        return cbm_arena_strdup(a, last + SKIP_ONE);
+    if (last_sep) {
+        return cbm_arena_strdup(a, last_sep + SKIP_ONE);
     }
     return path;
 }
@@ -161,6 +170,10 @@ static void process_py_import_stmt(CBMExtractCtx *ctx, TSNode node) {
                 emit_py_aliased_import(ctx, child, NULL);
             }
         }
+    } else if (strcmp(ts_node_type(name_node), "aliased_import") == 0) {
+        /* `import util as u` — the import_statement's `name` field points at the
+         * aliased_import; extract its real module name (not "util as u"). */
+        emit_py_aliased_import(ctx, name_node, NULL);
     } else {
         char *mod = cbm_node_text(a, name_node, ctx->source);
         if (mod && mod[0]) {
@@ -200,11 +213,21 @@ static void emit_py_import_from_name(CBMExtractCtx *ctx, TSNode child, const cha
 // Process a single Python import_from_statement node (from X import Y [as Z]).
 static void process_py_import_from(CBMExtractCtx *ctx, TSNode node) {
     CBMArena *a = ctx->arena;
+    // `from __future__ import annotations` is a dedicated node type whose first
+    // child is the literal `__future__` keyword (an identifier, not a
+    // dotted_name).  Emit a single import for `__future__` and return.
+    if (strcmp(ts_node_type(node), "future_import_statement") == 0) {
+        CBMImport imp = {.local_name = cbm_arena_strdup(a, "__future__"),
+                         .module_path = cbm_arena_strdup(a, "__future__")};
+        cbm_imports_push(&ctx->result->imports, a, imp);
+        return;
+    }
     TSNode module_node = resolve_py_module_node(node);
     char *mod_path =
         ts_node_is_null(module_node) ? NULL : cbm_node_text(a, module_node, ctx->source);
 
     uint32_t nc = ts_node_child_count(node);
+    bool emitted = false;
     for (uint32_t j = 0; j < nc; j++) {
         TSNode child = ts_node_child(node, j);
         const char *ck = ts_node_type(child);
@@ -214,9 +237,24 @@ static void process_py_import_from(CBMExtractCtx *ctx, TSNode node) {
                 continue;
             }
             emit_py_import_from_name(ctx, child, mod_path);
+            emitted = true;
         } else if (strcmp(ck, "aliased_import") == 0) {
             emit_py_aliased_import(ctx, child, mod_path);
+            emitted = true;
+        } else if (strcmp(ck, "wildcard_import") == 0) {
+            // `from os.path import *` — the module itself is the import.
+            if (mod_path && mod_path[0]) {
+                CBMImport imp = {.local_name = path_last(a, mod_path), .module_path = mod_path};
+                cbm_imports_push(&ctx->result->imports, a, imp);
+                emitted = true;
+            }
         }
+    }
+    // Defensive: a from-import with a module but no recognized name child
+    // (grammar variant) still records the module as an import.
+    if (!emitted && mod_path && mod_path[0]) {
+        CBMImport imp = {.local_name = path_last(a, mod_path), .module_path = mod_path};
+        cbm_imports_push(&ctx->result->imports, a, imp);
     }
 }
 
@@ -232,7 +270,10 @@ static void parse_python_imports(CBMExtractCtx *ctx) {
 
         if (strcmp(kind, "import_statement") == 0) {
             process_py_import_stmt(ctx, node);
-        } else if (strcmp(kind, "import_from_statement") == 0) {
+        } else if (strcmp(kind, "import_from_statement") == 0 ||
+                   strcmp(kind, "future_import_statement") == 0) {
+            // `from __future__ import annotations` is a distinct node type in
+            // tree-sitter-python but has the same shape (module + name list).
             process_py_import_from(ctx, node);
         }
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
@@ -431,6 +472,19 @@ static void walk_es_imports(CBMExtractCtx *ctx, TSNode root) {
         if (strcmp(kind, "import_statement") == 0) {
             if (process_es_import_statement(ctx, node)) {
                 push_children = false;
+            }
+        } else if (strcmp(kind, "export_statement") == 0) {
+            /* Re-export: `export { x } from './mod'` / `export * from './mod'`.
+             * It carries a `source` string just like an import and creates the
+             * same module dependency. */
+            TSNode src = ts_node_child_by_field_name(node, TS_FIELD("source"));
+            if (!ts_node_is_null(src)) {
+                char *path = strip_quotes(ctx->arena, cbm_node_text(ctx->arena, src, ctx->source));
+                if (path && path[0]) {
+                    CBMImport imp = {.local_name = path_last(ctx->arena, path),
+                                     .module_path = path};
+                    cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+                }
             }
         } else if (strcmp(kind, "call_expression") == 0) {
             /* CommonJS require() — only consume the node if we recognized
@@ -1082,6 +1136,205 @@ static void parse_wolfram_imports(CBMExtractCtx *ctx) {
     walk_wolfram_imports(ctx, ctx->root);
 }
 
+// --- PHP imports ---
+// tree-sitter-php models `use Foo\Bar;` as a `namespace_use_declaration`
+// containing one or more `namespace_use_clause` nodes (each a qualified_name,
+// optionally aliased via `as`).  Grouped `use Foo\{A, B};` uses a
+// `namespace_use_group` with `namespace_use_group_clause` children.  The bare
+// require/include forms remain `expression_statement`s and are still handled by
+// the text fallback.  Take the first qualified_name/name descendant of each
+// clause as the module path.
+static void emit_php_use_clause(CBMExtractCtx *ctx, TSNode clause, const char *group_prefix) {
+    CBMArena *a = ctx->arena;
+    // The path node is the qualified_name / namespace_name / name child.
+    TSNode path_node = clause;
+    bool found = false;
+    static const char *path_kinds[] = {"qualified_name", "namespace_name", "name", NULL};
+    for (const char **k = path_kinds; *k && !found; k++) {
+        if (find_first_descendant_of(clause, *k, &path_node)) {
+            found = true;
+        }
+    }
+    if (!found) {
+        return;
+    }
+    char *path = cbm_node_text(a, path_node, ctx->source);
+    if (!path || !path[0]) {
+        return;
+    }
+    if (group_prefix && group_prefix[0]) {
+        path = cbm_arena_sprintf(a, "%s\\%s", group_prefix, path);
+    }
+    // Alias: an `as` clause provides a trailing identifier (the second name).
+    TSNode alias = ts_node_child_by_field_name(clause, TS_FIELD("alias"));
+    const char *local =
+        !ts_node_is_null(alias) ? cbm_node_text(a, alias, ctx->source) : path_last(a, path);
+    CBMImport imp = {.local_name = local, .module_path = path};
+    cbm_imports_push(&ctx->result->imports, a, imp);
+}
+
+static void emit_php_use_decl(CBMExtractCtx *ctx, TSNode decl) {
+    CBMArena *a = ctx->arena;
+    // Grouped form: namespace_use_group with a leading prefix qualified_name.
+    TSNode group = decl;
+    if (find_first_descendant_of(decl, "namespace_use_group", &group)) {
+        // The prefix is the qualified_name sibling preceding the group within decl.
+        char *prefix = NULL;
+        uint32_t dc = ts_node_named_child_count(decl);
+        for (uint32_t i = 0; i < dc; i++) {
+            TSNode c = ts_node_named_child(decl, i);
+            const char *ck = ts_node_type(c);
+            if (strcmp(ck, "qualified_name") == 0 || strcmp(ck, "namespace_name") == 0 ||
+                strcmp(ck, "name") == 0) {
+                prefix = cbm_node_text(a, c, ctx->source);
+                break;
+            }
+        }
+        uint32_t gc = ts_node_named_child_count(group);
+        for (uint32_t i = 0; i < gc; i++) {
+            TSNode clause = ts_node_named_child(group, i);
+            const char *ck = ts_node_type(clause);
+            if (strcmp(ck, "namespace_use_group_clause") == 0 ||
+                strcmp(ck, "namespace_use_clause") == 0) {
+                emit_php_use_clause(ctx, clause, prefix);
+            }
+        }
+        return;
+    }
+    // Flat form: one or more namespace_use_clause children.
+    uint32_t dc = ts_node_named_child_count(decl);
+    bool any = false;
+    for (uint32_t i = 0; i < dc; i++) {
+        TSNode clause = ts_node_named_child(decl, i);
+        if (strcmp(ts_node_type(clause), "namespace_use_clause") == 0) {
+            emit_php_use_clause(ctx, clause, NULL);
+            any = true;
+        }
+    }
+    if (!any) {
+        // Some grammar versions inline the path directly under the declaration.
+        emit_php_use_clause(ctx, decl, NULL);
+    }
+}
+
+static void parse_php_imports(CBMExtractCtx *ctx) {
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    do {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        if (strcmp(kind, "namespace_use_declaration") == 0) {
+            emit_php_use_decl(ctx, node);
+        } else if (strcmp(kind, "expression_statement") == 0) {
+            // require / include / require_once / include_once
+            if (!try_generic_path_fields(ctx, node)) {
+                generic_import_from_text(ctx, node);
+            }
+        }
+    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
+}
+
+// --- C# imports ---
+// tree-sitter-c-sharp models `using System.Text;` as a `using_directive`.
+// The namespace path is a `qualified_name`/`identifier` child.  For an alias
+// form `using F = System.IO.File;` the directive has a `name` field holding the
+// alias identifier `F` and a separate qualified_name on the right of `=` — the
+// generic path-field extractor wrongly returns the alias `F`, so we instead
+// take the LAST qualified_name/identifier (the real namespace/type), and use
+// the `name` field as local_name when present.
+static void parse_csharp_imports(CBMExtractCtx *ctx) {
+    CBMArena *a = ctx->arena;
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    do {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (strcmp(ts_node_type(node), "using_directive") != 0) {
+            continue;
+        }
+        // Find the right-most qualified_name / identifier (the namespace/type),
+        // which is the import target even in the alias form `using F = X;`.
+        TSNode path_node = node;
+        bool found = false;
+        uint32_t nc = ts_node_named_child_count(node);
+        for (int i = (int)nc - 1; i >= 0; i--) {
+            TSNode c = ts_node_named_child(node, (uint32_t)i);
+            const char *ck = ts_node_type(c);
+            if (strcmp(ck, "qualified_name") == 0 || strcmp(ck, "identifier") == 0 ||
+                strcmp(ck, "member_access_expression") == 0 || strcmp(ck, "name") == 0) {
+                path_node = c;
+                found = true;
+                break;
+            }
+        }
+        char *path = found ? cbm_node_text(a, path_node, ctx->source) : NULL;
+        if (!path || !path[0]) {
+            // Fallback to text stripping (handles `using static X;`).
+            if (!try_generic_path_fields(ctx, node)) {
+                generic_import_from_text(ctx, node);
+            }
+            continue;
+        }
+        // Alias name, if any.
+        TSNode alias = ts_node_child_by_field_name(node, TS_FIELD("alias"));
+        const char *local =
+            !ts_node_is_null(alias) ? cbm_node_text(a, alias, ctx->source) : path_last(a, path);
+        CBMImport imp = {.local_name = local, .module_path = path};
+        cbm_imports_push(&ctx->result->imports, a, imp);
+    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
+}
+
+// --- Generic spec-driven imports ---
+// For grammar-only languages that have no dedicated parser above, consume the
+// `import_node_types` declared in the language's CBMLangSpec.  Each root-level
+// child whose type matches one of those node types is treated as an import:
+// first try the known path fields (path/source/module/name), then fall back to
+// stripping the leading keyword + trailing ';' from the node text.  This is the
+// same extraction strategy the dedicated `parse_generic_imports` used, but the
+// node-type set comes from the spec instead of a hardcoded string, so every
+// language with `import_node_types` configured gets imports extracted.
+static bool spec_type_matches(const char **types, const char *kind) {
+    if (!types) {
+        return false;
+    }
+    for (const char **t = types; *t; t++) {
+        if (strcmp(*t, kind) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void parse_spec_imports(CBMExtractCtx *ctx) {
+    const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
+    if (!spec || !spec->import_node_types) {
+        return;
+    }
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    do {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        if (!spec_type_matches(spec->import_node_types, kind)) {
+            continue;
+        }
+        if (!try_generic_path_fields(ctx, node)) {
+            generic_import_from_text(ctx, node);
+        }
+    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
+}
+
 // --- Embedded-language imports ---
 // Generic walker for host grammars (Svelte, Vue, HTML, Astro, ...) whose AST
 // keeps embedded sub-language source as raw_text (or similar) without parsing
@@ -1175,9 +1428,69 @@ static void parse_embedded_imports(CBMExtractCtx *ctx) {
     }
 }
 
+// --- Namespace / package declaration capture ---
+// Java/Kotlin/C#/PHP put the file's symbols inside a namespace/package whose
+// name is NOT reflected in the path-based QN scheme.  Capturing it lets the
+// pipeline resolve `using App.Utils` / `import com.example.Foo` to the File
+// node(s) that declare that namespace, which the path-derived QN alone cannot.
+static void capture_namespace_decl(CBMExtractCtx *ctx) {
+    CBMArena *a = ctx->arena;
+    static const char *ns_kinds[] = {"namespace_declaration",             // C#
+                                     "file_scoped_namespace_declaration", // C# 10
+                                     "package_declaration",               // Java / Kotlin
+                                     "package_header",                    // Kotlin
+                                     "namespace_definition",              // PHP
+                                     NULL};
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    do {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        if (!spec_type_matches(ns_kinds, kind)) {
+            continue;
+        }
+        // The namespace name is the first qualified_name / scoped_identifier /
+        // namespace_name / identifier descendant.
+        static const char *name_kinds[] = {"qualified_name",
+                                           "scoped_identifier",
+                                           "namespace_name",
+                                           "identifier",
+                                           "dotted_name",
+                                           "name",
+                                           NULL};
+        for (const char **nk = name_kinds; *nk; nk++) {
+            TSNode nn = node;
+            if (find_first_descendant_of(node, *nk, &nn)) {
+                char *ns = cbm_node_text(a, nn, ctx->source);
+                if (ns && ns[0]) {
+                    ctx->result->namespace_name = ns;
+                }
+                break;
+            }
+        }
+        if (ctx->result->namespace_name) {
+            break;
+        }
+    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
+}
+
 // --- Main dispatch ---
 
 void cbm_extract_imports(CBMExtractCtx *ctx) {
+    switch (ctx->language) {
+    case CBM_LANG_JAVA:
+    case CBM_LANG_KOTLIN:
+    case CBM_LANG_CSHARP:
+    case CBM_LANG_PHP:
+        capture_namespace_decl(ctx);
+        break;
+    default:
+        break;
+    }
     switch (ctx->language) {
     case CBM_LANG_GO:
         parse_go_imports(ctx);
@@ -1200,7 +1513,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         parse_generic_imports(ctx, "import_declaration");
         break;
     case CBM_LANG_CSHARP:
-        parse_generic_imports(ctx, "using_directive");
+        parse_csharp_imports(ctx);
         break;
     case CBM_LANG_RUST:
         parse_rust_imports(ctx);
@@ -1211,8 +1524,9 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         parse_c_imports(ctx);
         break;
     case CBM_LANG_PHP:
-        // PHP uses require/include calls, similar to Ruby
-        parse_generic_imports(ctx, "expression_statement");
+        // PHP `use Foo\Bar;` is a namespace_use_declaration; require/include are
+        // expression_statements.  parse_php_imports handles both.
+        parse_php_imports(ctx);
         break;
     case CBM_LANG_RUBY:
         parse_ruby_imports(ctx);
@@ -1280,6 +1594,9 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         parse_embedded_imports(ctx);
         break;
     default:
+        // Grammar-only languages with no dedicated parser: consume the
+        // import_node_types declared in their CBMLangSpec generically.
+        parse_spec_imports(ctx);
         break;
     }
 }

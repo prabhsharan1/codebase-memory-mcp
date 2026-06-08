@@ -226,25 +226,49 @@ static int check_go_class_implements(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_nod
     if (!fp_ends_with(cls->file_path, ".go")) {
         return 0;
     }
+    /* Resolve the struct's methods two ways and use whichever finds them:
+     *   (a) the struct's DEFINES_METHOD edges, matched by method NAME — the real
+     *       pipeline path, where Go receiver methods carry a flat QN (e.g.
+     *       "pkg.Area" rather than "pkg.Circle.Area"), so QN-string
+     *       reconstruction would miss; and
+     *   (b) the reconstructed QN "<ClassQN>.<methodName>" — used by tests and any
+     *       extractor that does emit class-qualified method QNs without
+     *       DEFINES_METHOD edges from the class. */
+    const cbm_gbuf_edge_t **cls_dm = NULL;
+    int cls_dm_count = 0;
+    cbm_gbuf_find_edges_by_source_type(ctx->gbuf, cls->id, "DEFINES_METHOD", &cls_dm, &cls_dm_count);
+
     char prefix[CBM_SZ_512];
     snprintf(prefix, sizeof(prefix), "%s.", cls->qualified_name);
+
+    /* For each interface method, find the matching struct method node. */
+    const cbm_gbuf_node_t *matched[CBM_SZ_128];
     for (int m = 0; m < im_count; m++) {
-        char method_qn[CBM_SZ_512];
-        snprintf(method_qn, sizeof(method_qn), "%s%s", prefix, imethods[m].name);
-        if (!cbm_gbuf_find_by_qn(ctx->gbuf, method_qn)) {
-            return 0;
+        const cbm_gbuf_node_t *found = NULL;
+        /* (a) DEFINES_METHOD edge by name */
+        for (int d = 0; d < cls_dm_count; d++) {
+            const cbm_gbuf_node_t *cm = cbm_gbuf_find_by_id(ctx->gbuf, cls_dm[d]->target_id);
+            if (cm && cm->name && strcmp(cm->name, imethods[m].name) == 0) {
+                found = cm;
+                break;
+            }
         }
+        /* (b) reconstructed "<ClassQN>.<methodName>" */
+        if (!found) {
+            char method_qn[CBM_SZ_512];
+            snprintf(method_qn, sizeof(method_qn), "%s%s", prefix, imethods[m].name);
+            found = cbm_gbuf_find_by_qn(ctx->gbuf, method_qn);
+        }
+        if (!found) {
+            return 0; /* struct does not satisfy the interface */
+        }
+        matched[m] = found;
     }
     cbm_gbuf_insert_edge(ctx->gbuf, cls->id, iface->id, "IMPLEMENTS", "{}");
     int edges = SKIP_ONE;
     for (int m = 0; m < im_count; m++) {
-        char method_qn[CBM_SZ_512];
-        snprintf(method_qn, sizeof(method_qn), "%s%s", prefix, imethods[m].name);
-        const cbm_gbuf_node_t *cm = cbm_gbuf_find_by_qn(ctx->gbuf, method_qn);
-        if (cm) {
-            cbm_gbuf_insert_edge(ctx->gbuf, cm->id, imethods[m].id, "OVERRIDE", "{}");
-            edges++;
-        }
+        cbm_gbuf_insert_edge(ctx->gbuf, matched[m]->id, imethods[m].id, "OVERRIDE", "{}");
+        edges++;
     }
     return edges;
 }

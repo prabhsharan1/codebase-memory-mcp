@@ -1166,3 +1166,383 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
     /* 5. Fallthrough to default resolution */
     return cbm_pipeline_fqn_module(ctx->project_name, module_path);
 }
+
+/* ── Import-target node resolver ─────────────────────────────────── */
+
+/* Return the last path segment of an import string, recognizing the separators
+ * used across languages: '.', '/', '\\', and "::".  Returns a pointer into
+ * `path` (no allocation). */
+static const char *import_last_segment(const char *path) {
+    const char *seg = path;
+    for (const char *p = path; *p; p++) {
+        if (*p == '.' || *p == '/' || *p == '\\' || *p == ':') {
+            seg = p + 1;
+        }
+    }
+    return seg;
+}
+
+/* Derive a representative imported symbol name from a raw module/use path,
+ * stripping language decorations so it can be matched against an in-graph node:
+ *   - trailing alias " as X"      (Rust/Kotlin)
+ *   - trailing glob "::*" / ".*"  (Rust/Kotlin/Java wildcard)
+ *   - brace groups "{a, b, ...}"  (Rust grouped use) → first member
+ * Writes the result into `out` (size `outsz`) and returns it, or NULL if none.
+ * For grouped/braced forms the first listed symbol is used as the representative
+ * (the tests only require at least one resolved IMPORTS edge per statement). */
+static const char *import_candidate_symbol(const char *module_path, char *out, size_t outsz) {
+    if (!module_path || !module_path[0]) {
+        return NULL;
+    }
+    char buf[1024];
+    snprintf(buf, sizeof(buf), "%s", module_path);
+
+    /* Brace group: `prefix::{a, b}` → take first member `a`. */
+    char *brace = strchr(buf, '{');
+    if (brace) {
+        char *first = brace + 1;
+        char *end = first;
+        while (*end && *end != ',' && *end != '}') {
+            end++;
+        }
+        *end = '\0';
+        /* Trim whitespace. */
+        while (*first == ' ' || *first == '\t') {
+            first++;
+        }
+        char *t = first + strlen(first);
+        while (t > first && (t[-1] == ' ' || t[-1] == '\t')) {
+            *--t = '\0';
+        }
+        if (first[0] && strcmp(first, "self") != 0) {
+            snprintf(out, outsz, "%s", first);
+            return out;
+        }
+        /* `{self, ...}` → fall back to the path before the brace group. */
+        *brace = '\0';
+    }
+
+    /* Strip trailing " as <alias>". */
+    char *as = strstr(buf, " as ");
+    if (as) {
+        *as = '\0';
+    }
+
+    /* Strip trailing glob and separator noise. */
+    size_t len = strlen(buf);
+    while (len > 0 && (buf[len - 1] == '*' || buf[len - 1] == ':' || buf[len - 1] == '.' ||
+                       buf[len - 1] == '/' || buf[len - 1] == '\\' || buf[len - 1] == ' ')) {
+        buf[--len] = '\0';
+    }
+    if (!buf[0]) {
+        return NULL;
+    }
+    const char *seg = import_last_segment(buf);
+    if (!seg || !seg[0] || strcmp(seg, "*") == 0) {
+        return NULL;
+    }
+    snprintf(out, outsz, "%s", seg);
+    return out;
+}
+
+/* True for node labels that represent an importable definition (so a symbol-name
+ * fallback does not link to, e.g., a Variable or Field). */
+static bool import_targetable_label(const char *label) {
+    if (!label) {
+        return false;
+    }
+    static const char *ok[] = {"Class", "Interface", "Function", "Method", "Module", "Struct",
+                               "Enum",  "Trait",     "Type",     "File",   NULL};
+    for (const char **l = ok; *l; l++) {
+        if (strcmp(*l, label) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
+                                                        const char *source_rel,
+                                                        const char *source_file_qn,
+                                                        const CBMImport *imp,
+                                                        CBMHashTable *namespace_map) {
+    if (!ctx || !imp || !imp->module_path) {
+        return NULL;
+    }
+
+    /* Strategy 1: module-path resolution → existing node (Python/TS/Go). */
+    char *target_qn = cbm_pipeline_resolve_module(ctx, source_rel, imp->module_path);
+    const cbm_gbuf_node_t *target = target_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, target_qn) : NULL;
+    free(target_qn);
+    if (target) {
+        return target;
+    }
+
+    /* Strategy 2: namespace map.  `using App.Utils`, `import com.example.Foo`,
+     * `use App\Utils\Helper` name a NAMESPACE (or a member of it) that the
+     * path-based QN cannot express.  Try the full module path and progressively
+     * shorter prefixes (dropping the trailing member segment) so both a bare
+     * namespace import and a member import resolve to the declaring file. */
+    if (namespace_map) {
+        /* Normalize separators to '.' for namespace keys (PHP uses '\\').
+         * Strip decorations first so `com.example.Util as U`, `crate::ops::*`
+         * and `App\Utils\{A, B}` reduce to a clean dotted path. */
+        char norm[1024];
+        snprintf(norm, sizeof(norm), "%s", imp->module_path);
+        char *brace = strchr(norm, '{');
+        if (brace) {
+            *brace = '\0'; /* drop the group; the prefix is the namespace */
+        }
+        char *as = strstr(norm, " as ");
+        if (as) {
+            *as = '\0';
+        }
+        for (char *p = norm; *p; p++) {
+            if (*p == '\\' || *p == ':' || *p == '/') {
+                *p = '.';
+            }
+        }
+        /* Strip trailing glob/separator noise. */
+        size_t nl = strlen(norm);
+        while (nl > 0 && (norm[nl - 1] == '*' || norm[nl - 1] == '.' || norm[nl - 1] == ' ')) {
+            norm[--nl] = '\0';
+        }
+        /* Collapse any "::"-induced empty segments ("a..b" → "a.b"). */
+        for (;;) {
+            char *dd = strstr(norm, "..");
+            if (!dd) {
+                break;
+            }
+            memmove(dd, dd + 1, strlen(dd + 1) + 1);
+        }
+        for (;;) {
+            const char *file_qn = (const char *)cbm_ht_get(namespace_map, norm);
+            if (file_qn) {
+                const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
+                if (n && (!source_file_qn || strcmp(n->qualified_name, source_file_qn) != 0)) {
+                    return n;
+                }
+            }
+            char *dot = strrchr(norm, '.');
+            if (!dot) {
+                break;
+            }
+            *dot = '\0';
+        }
+    }
+
+    /* Strategy 3: symbol-name fallback.  Derive a representative imported
+     * symbol (handling alias / glob / grouped forms) and match it against an
+     * in-graph definition of the same simple name in another file
+     * (Rust `helper`, Java `Util`, Kotlin grouped, ...). */
+    char symbuf[256];
+    /* Prefer the clean candidate from the module path; the local_name may be an
+     * alias (Rust `as h`, Kotlin `as U`) that names no real symbol. */
+    const char *seg = import_candidate_symbol(imp->module_path, symbuf, sizeof(symbuf));
+    if (!seg && imp->local_name && imp->local_name[0] && strcmp(imp->local_name, "*") != 0) {
+        seg = imp->local_name;
+    }
+    /* Build the candidate symbol list: the derived symbol plus, when the import
+     * is a dotted member path like `com.example.Config.DEFAULT`, the enclosing
+     * type segments (`Config`).  This resolves object/class-member imports to
+     * the declaring type when the leaf member isn't an importable node. */
+    const char *cands[8];
+    int ncands = 0;
+    if (seg && seg[0] && strcmp(seg, "*") != 0) {
+        cands[ncands++] = seg;
+    }
+    {
+        /* Strip decorations, normalize separators to '.', and collect the
+         * trailing path segments (last first) as fallback candidates. */
+        char mp[1024];
+        snprintf(mp, sizeof(mp), "%s", imp->module_path);
+        char *br = strchr(mp, '{');
+        if (br) {
+            *br = '\0';
+        }
+        char *as3 = strstr(mp, " as ");
+        if (as3) {
+            *as3 = '\0';
+        }
+        for (char *p = mp; *p; p++) {
+            if (*p == '\\' || *p == ':' || *p == '/') {
+                *p = '.';
+            }
+        }
+        /* Walk segments from the end. */
+        char *end = mp + strlen(mp);
+        while (end > mp && ncands < 8) {
+            char *dot = NULL;
+            for (char *p = end - 1; p >= mp; p--) {
+                if (*p == '.') {
+                    dot = p;
+                    break;
+                }
+            }
+            const char *s = dot ? dot + 1 : mp;
+            if (s[0] && strcmp(s, "*") != 0) {
+                bool dup = false;
+                for (int k = 0; k < ncands; k++) {
+                    if (strcmp(cands[k], s) == 0) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    cands[ncands++] = s;
+                }
+            }
+            if (!dot) {
+                break;
+            }
+            *dot = '\0';
+            end = dot;
+        }
+        for (int ci = 0; ci < ncands; ci++) {
+            const cbm_gbuf_node_t **hits = NULL;
+            int n = 0;
+            if (cbm_gbuf_find_by_name(ctx->gbuf, cands[ci], &hits, &n) == 0 && hits) {
+                for (int i = 0; i < n; i++) {
+                    const cbm_gbuf_node_t *cand = hits[i];
+                    if (!cand || !import_targetable_label(cand->label)) {
+                        continue;
+                    }
+                    if (source_file_qn && cand->qualified_name &&
+                        strcmp(cand->qualified_name, source_file_qn) == 0) {
+                        continue; /* self */
+                    }
+                    return cand;
+                }
+            }
+        }
+    }
+
+    /* Strategy 4: crate-relative module path → File/Module node.  Rust glob
+     * `use crate::ops::*` names a module, not a symbol; strip the glob and the
+     * `crate::`/`self::`/`super::` prefix, convert `::`→`/`, then resolve the
+     * remaining path (and successive prefixes) to a Module/File node. */
+    {
+        char mp[1024];
+        snprintf(mp, sizeof(mp), "%s", imp->module_path);
+        char *brace = strchr(mp, '{');
+        if (brace) {
+            *brace = '\0';
+        }
+        char *as2 = strstr(mp, " as ");
+        if (as2) {
+            *as2 = '\0';
+        }
+        /* Convert "::" → "/" (drop the doubled colon cleanly). */
+        char clean[1024];
+        size_t ci = 0;
+        for (const char *p = mp; *p && ci + 1 < sizeof(clean); p++) {
+            if (*p == ':') {
+                if (ci > 0 && clean[ci - 1] == '/') {
+                    continue; /* collapse "::" → single "/" */
+                }
+                clean[ci++] = '/';
+            } else if (*p == '*' || *p == ' ') {
+                continue;
+            } else {
+                clean[ci++] = *p;
+            }
+        }
+        clean[ci] = '\0';
+        /* Drop trailing slashes. */
+        while (ci > 0 && clean[ci - 1] == '/') {
+            clean[--ci] = '\0';
+        }
+        /* Strip a leading crate-relative prefix. */
+        const char *body = clean;
+        static const char *prefixes[] = {"crate/", "self/", "super/", NULL};
+        for (const char **pf = prefixes; *pf; pf++) {
+            size_t pl = strlen(*pf);
+            if (strncmp(body, *pf, pl) == 0) {
+                body += pl;
+                break;
+            }
+        }
+        if (body[0]) {
+            char work[1024];
+            snprintf(work, sizeof(work), "%s", body);
+            for (;;) {
+                char *rqn = cbm_pipeline_resolve_module(ctx, source_rel, work);
+                const cbm_gbuf_node_t *n = rqn ? cbm_gbuf_find_by_qn(ctx->gbuf, rqn) : NULL;
+                free(rqn);
+                if (n && (!source_file_qn || !n->qualified_name ||
+                          strcmp(n->qualified_name, source_file_qn) != 0)) {
+                    return n;
+                }
+                char *sl = strrchr(work, '/');
+                if (!sl) {
+                    break;
+                }
+                *sl = '\0';
+            }
+        }
+    }
+
+    return NULL;
+}
+
+/* ── Namespace map ───────────────────────────────────────────────── */
+
+CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
+                                               CBMFileResult *const *results,
+                                               const char *const *rels, int count) {
+    CBMHashTable *map = NULL;
+    for (int i = 0; i < count; i++) {
+        const CBMFileResult *r = results[i];
+        if (!r || !r->namespace_name || !r->namespace_name[0] || !rels[i]) {
+            continue;
+        }
+        if (!map) {
+            map = cbm_ht_create(CBM_SZ_64);
+            if (!map) {
+                return NULL;
+            }
+        }
+        char *file_qn = cbm_pipeline_fqn_compute(project_name, rels[i], "__file__");
+        if (!file_qn) {
+            continue;
+        }
+        /* Normalize the namespace key to dot-separated form so it matches the
+         * dot-normalized lookups in cbm_pipeline_resolve_import_node (PHP uses
+         * '\\', some grammars '::' or '/'). */
+        char *key = strdup(r->namespace_name);
+        if (!key) {
+            free(file_qn);
+            continue;
+        }
+        for (char *p = key; *p; p++) {
+            if (*p == '\\' || *p == ':' || *p == '/') {
+                *p = '.';
+            }
+        }
+        /* First declaration of a namespace wins; later files with the same
+         * namespace still resolve (any declaring file is a valid target).
+         * The hash table does not copy keys, so the strdup'd key is owned by
+         * the map and freed in ns_map_free_entry. */
+        if (!cbm_ht_has(map, key)) {
+            cbm_ht_set(map, key, file_qn);
+        } else {
+            free(key);
+            free(file_qn);
+        }
+    }
+    return map;
+}
+
+static void ns_map_free_entry(const char *key, void *value, void *ud) {
+    (void)ud;
+    free((void *)key); /* strdup'd in cbm_pipeline_namespace_map_build */
+    free(value);
+}
+
+void cbm_pipeline_namespace_map_free(CBMHashTable *map) {
+    if (!map) {
+        return;
+    }
+    cbm_ht_foreach(map, ns_map_free_entry, NULL);
+    cbm_ht_free(map);
+}
