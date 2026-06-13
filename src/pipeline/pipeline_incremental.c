@@ -845,6 +845,11 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * reindex can correctly classify those files instead of seeing them
      * as never-existed; also exports a fast-mode artifact when one is
      * already present alongside the repo). */
+    /* Record committed counts before dump_and_persist (whose dump frees the
+     * gbuf node index, zeroing the count) so the #334 plausibility gate also
+     * covers incremental reindexes, not just full ones. */
+    cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
+                                      cbm_gbuf_edge_count(existing));
     dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
                      mode_skipped_count, cbm_pipeline_repo_path(p));
     free_mode_skipped(mode_skipped, mode_skipped_count);

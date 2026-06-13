@@ -233,6 +233,13 @@ void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int 
     }
 }
 
+void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges) {
+    if (p) {
+        p->committed_nodes = nodes;
+        p->committed_edges = edges;
+    }
+}
+
 /* Resolve the DB path for this pipeline. Caller must free(). */
 static char *resolve_db_path(const cbm_pipeline_t *p) {
     char *path = malloc(CBM_SZ_1K);
@@ -847,13 +854,17 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         *last_slash = '\0';
         cbm_mkdir_p(db_dir, CBM_DIR_PERMS);
     }
+    /* Capture committed counts BEFORE the dump. cbm_gbuf_dump_to_sqlite calls
+     * release_gbuf_indexes(), which frees node_by_qn (graph_buffer.c), after
+     * which cbm_gbuf_node_count() returns 0. Reading these post-dump left
+     * committed_nodes at 0, so the #334 plausibility gate never fired. */
+    p->committed_nodes = cbm_gbuf_node_count(p->gbuf);
+    p->committed_edges = cbm_gbuf_edge_count(p->gbuf);
     int rc = cbm_gbuf_dump_to_sqlite(p->gbuf, db_path);
     if (rc != 0) {
         cbm_log_error("pipeline.err", "phase", "dump");
         return rc;
     }
-    p->committed_nodes = cbm_gbuf_node_count(p->gbuf);
-    p->committed_edges = cbm_gbuf_edge_count(p->gbuf);
     cbm_log_info("pass.timing", "pass", "dump", "elapsed_ms", itoa_buf((int)elapsed_ms(*t)));
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     if (hash_store) {

@@ -12,6 +12,7 @@
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
 #include "git/git_context.h"
+#include "foundation/dump_verify.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -6030,6 +6031,48 @@ TEST(pipeline_complexity_transitive_loop_depth) {
     PASS();
 }
 
+/* Regression for #334: the plausibility gate compares committed (extracted)
+ * node count against persisted rows. committed_nodes must be captured BEFORE
+ * cbm_gbuf_dump_to_sqlite frees the gbuf node index — otherwise it reads 0 and
+ * the gate is silently inert. Drives the real pipeline (not a synthetic count)
+ * and asserts committed_nodes is populated and matches what was persisted. */
+TEST(pipeline_committed_counts_match_persisted) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/committed_test.db", g_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    ASSERT_EQ(rc, 0);
+
+    int committed_nodes = -1;
+    int committed_edges = -1;
+    cbm_pipeline_get_committed_counts(p, &committed_nodes, &committed_edges);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+    int persisted_nodes = cbm_store_count_nodes(s, project);
+    cbm_store_close(s);
+
+    /* The bug captured committed_nodes after the node index was freed → 0. */
+    ASSERT_GT(committed_nodes, 0);
+    /* A faithful full dump persists exactly what it committed. */
+    ASSERT_EQ(committed_nodes, persisted_nodes);
+    /* The gate must NOT flag a healthy full index as degraded. */
+    ASSERT_FALSE(cbm_dump_verify_is_degraded(committed_nodes, persisted_nodes,
+                                             CBM_DUMP_VERIFY_DEFAULT_RATIO,
+                                             CBM_DUMP_VERIFY_MIN_FLOOR));
+
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
 SUITE(pipeline) {
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);
@@ -6048,6 +6091,7 @@ SUITE(pipeline) {
     RUN_TEST(store_bulk_persistence);
     /* Integration: structure pass */
     RUN_TEST(pipeline_structure_nodes);
+    RUN_TEST(pipeline_committed_counts_match_persisted);
     RUN_TEST(pipeline_structure_edges);
     RUN_TEST(pipeline_branch_root_structure);
     RUN_TEST(pipeline_project_name_derived);
