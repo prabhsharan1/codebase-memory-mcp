@@ -718,6 +718,46 @@ TSNode cbm_find_enclosing_func(TSNode node, CBMLanguage lang) {
 }
 
 // Get the name of a function node (basic: try "name" field)
+// C/C++/CUDA/GLSL: function_definition has no "name" field — the function name is
+// nested in the declarator chain (pointer/function/parenthesized/array
+// declarators wrap it). Descend the `declarator` field to the innermost name
+// node. Without this, calls made inside C functions are attributed to the module
+// rather than the enclosing function (issue #438). Mirrors resolve_c_declarator_name()
+// in extract_defs.c.
+#ifndef CBM_DECLARATOR_DEPTH_LIMIT
+#define CBM_DECLARATOR_DEPTH_LIMIT 8 /* matches DECLARATOR_DEPTH_LIMIT in extract_defs.c */
+#endif
+static TSNode c_declarator_name_node(TSNode func_node) {
+    TSNode decl = ts_node_child_by_field_name(func_node, TS_FIELD("declarator"));
+    for (int depth = 0; depth < CBM_DECLARATOR_DEPTH_LIMIT && !ts_node_is_null(decl); depth++) {
+        const char *dk = ts_node_type(decl);
+        if (strcmp(dk, "identifier") == 0 || strcmp(dk, "field_identifier") == 0 ||
+            strcmp(dk, "type_identifier") == 0 || strcmp(dk, "destructor_name") == 0 ||
+            strcmp(dk, "operator_name") == 0 || strcmp(dk, "operator_cast") == 0) {
+            return decl;
+        }
+        if (strcmp(dk, "qualified_identifier") == 0 || strcmp(dk, "scoped_identifier") == 0) {
+            // out-of-line method def (Foo::bar): take the rightmost name segment
+            TSNode nm = ts_node_child_by_field_name(decl, TS_FIELD("name"));
+            if (!ts_node_is_null(nm)) {
+                decl = nm;
+                continue;
+            }
+            return decl;
+        }
+        TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
+        if (ts_node_is_null(inner) && ts_node_named_child_count(decl) > 0) {
+            inner = ts_node_named_child(decl, 0);
+        }
+        if (ts_node_is_null(inner)) {
+            break;
+        }
+        decl = inner;
+    }
+    TSNode null_node = {0};
+    return null_node;
+}
+
 static const char *func_node_name(CBMArena *a, TSNode func_node, const char *source,
                                   CBMLanguage lang) {
     // Wolfram: set_delayed_top/set_top/set_delayed/set — LHS is apply(user_symbol("f"), ...)
@@ -750,6 +790,13 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
             if (!ts_node_is_null(vname)) {
                 return cbm_node_text(a, vname, source);
             }
+        }
+    }
+    // C/C++/CUDA/GLSL: function_definition carries its name in the declarator chain.
+    if (strcmp(ts_node_type(func_node), "function_definition") == 0) {
+        TSNode dn = c_declarator_name_node(func_node);
+        if (!ts_node_is_null(dn)) {
+            return cbm_node_text(a, dn, source);
         }
     }
     return NULL;
