@@ -318,6 +318,12 @@ int cbm_store_count_nodes_scoped(cbm_store_t *s, const char *project, const char
 
 int cbm_store_count_edges_scoped(cbm_store_t *s, const char *project, const char *path);
 
+/* True when path is a non-empty scope after normalization (issue #604). */
+bool cbm_store_arch_path_scoped(const char *path);
+
+/* When scoped, writes normalized directory prefix into norm_out. Returns false if unscoped. */
+bool cbm_store_normalize_arch_path(const char *path, char *norm_out, size_t norm_sz);
+
 /* Delete all nodes for a project (cascade deletes edges). */
 int cbm_store_delete_nodes_by_project(cbm_store_t *s, const char *project);
 

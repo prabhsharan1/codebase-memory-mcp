@@ -1975,7 +1975,8 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
 
     int node_count = cbm_store_count_nodes_scoped(store, project, scope_path);
     int edge_count = cbm_store_count_edges_scoped(store, project, scope_path);
-    bool path_scoped = scope_path && scope_path[0];
+    char norm_path[CBM_SZ_512];
+    bool path_scoped = cbm_store_normalize_arch_path(scope_path, norm_path, sizeof(norm_path));
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -1985,7 +1986,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_str(doc, root, "project", project);
     }
     if (path_scoped) {
-        yyjson_mut_obj_add_str(doc, root, "path", scope_path);
+        yyjson_mut_obj_add_str(doc, root, "path", norm_path);
         int root_nodes = cbm_store_count_nodes(store, project);
         int root_edges = cbm_store_count_edges(store, project);
         yyjson_mut_obj_add_int(doc, root, "root_total_nodes", root_nodes);

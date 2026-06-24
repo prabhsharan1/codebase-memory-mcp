@@ -2942,9 +2942,19 @@ static bool arch_path_prepare(const char *path, char *norm_out, size_t norm_sz, 
     strncpy(norm_out, path, norm_sz - 1);
     norm_out[norm_sz - 1] = '\0';
     size_t len = strlen(norm_out);
-    while (len > 0 && (norm_out[len - 1] == ' ' || norm_out[len - 1] == '\t')) {
+    while (len > 0 && (norm_out[len - 1] == ' ' || norm_out[len - 1] == '\t' ||
+                       norm_out[len - 1] == '/')) {
         norm_out[--len] = '\0';
     }
+    /* Collapse duplicate slashes */
+    size_t w = 0;
+    for (size_t r = 0; norm_out[r] != '\0'; r++) {
+        if (norm_out[r] == '/' && w > 0 && norm_out[w - 1] == '/') {
+            continue;
+        }
+        norm_out[w++] = norm_out[r];
+    }
+    norm_out[w] = '\0';
     if (norm_out[0] == '\0') {
         return false;
     }
@@ -2960,6 +2970,17 @@ static void arch_bind_path_scope(sqlite3_stmt *stmt, int exact_idx, int like_idx
                                  const char *like_pat) {
     bind_text(stmt, exact_idx, norm);
     bind_text(stmt, like_idx, like_pat);
+}
+
+bool cbm_store_arch_path_scoped(const char *path) {
+    char norm[CBM_SZ_512];
+    char like[CBM_SZ_512 + 4];
+    return arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
+}
+
+bool cbm_store_normalize_arch_path(const char *path, char *norm_out, size_t norm_sz) {
+    char like[CBM_SZ_512 + 4];
+    return arch_path_prepare(path, norm_out, norm_sz, like, sizeof(like));
 }
 
 int cbm_store_count_nodes_scoped(cbm_store_t *s, const char *project, const char *path) {

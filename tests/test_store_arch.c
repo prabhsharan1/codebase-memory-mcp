@@ -277,6 +277,19 @@ TEST(arch_path_scoping) {
 
     ASSERT_TRUE(cbm_store_count_nodes(s, "pscope") > cbm_store_count_nodes_scoped(s, "pscope", "apps/foo"));
 
+    cbm_architecture_info_t scoped_slash;
+    memset(&scoped_slash, 0, sizeof(scoped_slash));
+    ASSERT_EQ(cbm_store_get_architecture(s, "pscope", "apps/foo/", aspects, 2, &scoped_slash),
+              CBM_STORE_OK);
+    int slash_go = 0;
+    for (int i = 0; i < scoped_slash.language_count; i++) {
+        if (strcmp(scoped_slash.languages[i].language, "Go") == 0) {
+            slash_go = scoped_slash.languages[i].file_count;
+        }
+    }
+    ASSERT_EQ(slash_go, scoped_go);
+
+    cbm_store_architecture_free(&scoped_slash);
     cbm_store_architecture_free(&whole);
     cbm_store_architecture_free(&scoped);
     cbm_store_close(s);
