@@ -3323,6 +3323,7 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+    def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
