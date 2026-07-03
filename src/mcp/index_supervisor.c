@@ -3,6 +3,7 @@
  */
 #include "index_supervisor.h"
 
+#include "foundation/compat.h"    /* cbm_setenv, cbm_unsetenv */
 #include "foundation/compat_fs.h" /* cbm_mkdir_p, cbm_fopen */
 #include "foundation/log.h"
 #include "foundation/platform.h"  /* cbm_resolve_cache_dir */
@@ -108,8 +109,8 @@ static void worker_tmp_path(char *out, size_t out_sz, int pid, const char *suffi
     }
 }
 
-int cbm_index_spawn_worker(const char *args_json, const char *exclude_file,
-                           cbm_index_worker_result_t *result) {
+int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char *marker_file,
+                           const char *quarantine_file, cbm_index_worker_result_t *result) {
     result->outcome = CBM_PROC_SPAWN_FAILED;
     result->exit_code = -1;
     result->term_signal = 0;
@@ -128,7 +129,7 @@ int cbm_index_spawn_worker(const char *args_json, const char *exclude_file,
     worker_tmp_path(log_path, sizeof(log_path), pid, ".log");
     (void)remove(resp_path); /* clear any stale file */
 
-    const char *argv[12];
+    const char *argv[8];
     int n = 0;
     argv[n++] = self;
     argv[n++] = "cli";
@@ -137,11 +138,21 @@ int cbm_index_spawn_worker(const char *args_json, const char *exclude_file,
     argv[n++] = args_json;
     argv[n++] = "--response-out";
     argv[n++] = resp_path;
-    if (exclude_file && exclude_file[0]) {
-        argv[n++] = "--exclude-file";
-        argv[n++] = exclude_file;
-    }
     argv[n] = NULL;
+
+    /* Recovery-run probe knobs → inherited env for the child. Spawns are
+     * sequential, so mutating the parent's environment around a single spawn is
+     * safe. Set only the requested knobs; unset them all again after reaping so
+     * a later attempt (or the caller) starts from a clean environment. */
+    if (single_thread) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    }
+    if (marker_file && marker_file[0]) {
+        cbm_setenv("CBM_INDEX_MARKER_FILE", marker_file, 1);
+    }
+    if (quarantine_file && quarantine_file[0]) {
+        cbm_setenv("CBM_INDEX_QUARANTINE_FILE", quarantine_file, 1);
+    }
 
     cbm_proc_opts_t opts = {0};
     opts.bin = self;
@@ -151,7 +162,19 @@ int cbm_index_spawn_worker(const char *args_json, const char *exclude_file,
     opts.delete_log_on_exit = true;
 
     cbm_proc_result_t r;
-    if (cbm_subprocess_run(&opts, &r) != 0) {
+    int run_rc = cbm_subprocess_run(&opts, &r);
+
+    if (single_thread) {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    if (marker_file && marker_file[0]) {
+        cbm_unsetenv("CBM_INDEX_MARKER_FILE");
+    }
+    if (quarantine_file && quarantine_file[0]) {
+        cbm_unsetenv("CBM_INDEX_QUARANTINE_FILE");
+    }
+
+    if (run_rc != 0) {
         (void)remove(resp_path);
         cbm_log_warn("index.supervisor.spawn_failed", "action", "degrade_in_process");
         return -1;

@@ -14,6 +14,8 @@
 #include "lsp/rust_lsp.h"
 #include "preprocessor.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h" // cbm_fopen — crash-supervisor per-file marker write
+#include "foundation/hash_table.h" // CBMHashTable — crash-supervisor quarantine set
 #include "tree_sitter/api.h" // TSParser, TSNode, TSTree, TSInput, TSLanguage, TSPoint, TSParseOptions, TSParseState
 #include "foundation/constants.h"
 #include "mimalloc.h" // mi_malloc/mi_calloc/mi_realloc/mi_free/mi_usable_size — bind 3rd-party allocators (#424)
@@ -500,6 +502,97 @@ static int count_params_from_signature(const char *sig) {
  * or spins forever (an external-scanner infinite loop the quiet-timeout kills).
  * This gives an honest guard — green iff the supervisor actually contains a real
  * fault — instead of a fixture that may stop faulting once a root cause is fixed. */
+/* Crash-supervisor per-file marker (Stage 3c skip-and-continue). In the
+ * supervisor's single-threaded recovery re-run, cbm_extract_file records the
+ * file it is ABOUT to process here (CBM_INDEX_MARKER_FILE) before touching it,
+ * so that if this file hard-crashes the worker the parent can read the marker
+ * back and learn the EXACT crasher to quarantine. Only meaningful single-
+ * threaded (parallel would race the marker); the env var is set solely by the
+ * supervisor during recovery, so it is a no-op on every normal run. */
+static void cbm_index_write_marker(const char *rel_path) {
+    const char *mf = getenv("CBM_INDEX_MARKER_FILE");
+    if (!mf || !mf[0] || !rel_path || !rel_path[0]) {
+        return;
+    }
+    FILE *f = cbm_fopen(mf, "wb");
+    if (f) {
+        (void)fputs(rel_path, f);
+        (void)fclose(f);
+    }
+}
+
+/* ── Crash-quarantine set (Stage 3c skip-and-continue) ──────────────────────
+ * After a crash the supervisor re-runs the worker single-threaded, passing
+ * CBM_INDEX_QUARANTINE_FILE — a newline-delimited list of repo-relative paths
+ * that already crashed the indexer and MUST NOT be extracted again. Owned here,
+ * next to the other env-driven extract hooks (marker + fault injector), so the
+ * single hard guard lives at the one choke point every pass funnels through
+ * (cbm_extract_file): whether a pass re-extracts from disk on a cache miss
+ * (sequential pass_calls/usages/semantic) or extracts fresh, a quarantined file
+ * short-circuits to an empty result and never reaches the parser/crash. The
+ * pipeline extract loops separately REPORT the skip as phase="crash" via
+ * cbm_index_is_quarantined() so the crasher surfaces in the response skipped[].
+ * Loaded once, lazily; read-only after load (safe for the parallel workers,
+ * though recovery runs single-threaded). Unset env ⇒ empty set ⇒ cheap no-op. */
+static CBMHashTable *g_quarantine_set = NULL;
+enum { CBM_QSET_UNINIT = 0, CBM_QSET_INITING = 1, CBM_QSET_INITED = 2 };
+static atomic_int g_quarantine_state = CBM_QSET_UNINIT;
+
+static void cbm_quarantine_load(void) {
+    const char *qf = getenv("CBM_INDEX_QUARANTINE_FILE");
+    if (!qf || !qf[0]) {
+        return; /* normal path: empty set */
+    }
+    FILE *f = cbm_fopen(qf, "rb");
+    if (!f) {
+        return;
+    }
+    CBMHashTable *set = cbm_ht_create(16);
+    if (!set) {
+        (void)fclose(f);
+        return;
+    }
+    char line[2048];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (len == 0) {
+            continue;
+        }
+        /* The table borrows key pointers, so dup each path. Intentionally never
+         * freed: the set lives for the whole (short-lived worker) process. */
+        char *key = cbm_strdup(line);
+        if (key) {
+            cbm_ht_set(set, key, (void *)(intptr_t)1);
+        }
+    }
+    (void)fclose(f);
+    g_quarantine_set = set;
+}
+
+bool cbm_index_is_quarantined(const char *rel_path) {
+    if (!rel_path || !rel_path[0]) {
+        return false;
+    }
+    int state = atomic_load(&g_quarantine_state);
+    if (state != CBM_QSET_INITED) {
+        /* First caller wins the CAS and loads; racers spin until INITED.
+         * Same once-init pattern as cbm_ui_log_init (http_server.c). */
+        state = CBM_QSET_UNINIT;
+        if (atomic_compare_exchange_strong(&g_quarantine_state, &state, CBM_QSET_INITING)) {
+            cbm_quarantine_load();
+            atomic_store(&g_quarantine_state, CBM_QSET_INITED);
+        } else {
+            while (atomic_load(&g_quarantine_state) != CBM_QSET_INITED) {
+                cbm_usleep(1000); /* 1ms */
+            }
+        }
+    }
+    return g_quarantine_set && cbm_ht_has(g_quarantine_set, rel_path);
+}
+
 static void cbm_test_fault_inject(const char *rel_path) {
     if (!rel_path || !rel_path[0]) {
         return;
@@ -519,8 +612,6 @@ static void cbm_test_fault_inject(const char *rel_path) {
 CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage language,
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, const char **include_paths) {
-    cbm_test_fault_inject(rel_path);
-
     // Allocate result on heap (arena inside for all string data)
     enum { SINGLE = 1 };
     CBMFileResult *result = (CBMFileResult *)calloc(SINGLE, sizeof(CBMFileResult));
@@ -530,6 +621,20 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
 
     cbm_arena_init(&result->arena);
     CBMArena *a = &result->arena;
+
+    /* Crash-quarantine hard guard (Stage 3c): a file the supervisor pinned as a
+     * crasher must NEVER be parsed again. Return a clean empty result BEFORE the
+     * marker write and fault injector so no pass (including sequential re-extract
+     * passes that miss the result cache) can crash on it. The pipeline extract
+     * loops separately record it as a phase="crash" skip. Checked before the
+     * marker so quarantined files never overwrite it — the marker keeps pointing
+     * at the real (non-quarantined) file being processed when a crash hits. */
+    if (cbm_index_is_quarantined(rel_path)) {
+        return result;
+    }
+
+    cbm_index_write_marker(rel_path);
+    cbm_test_fault_inject(rel_path);
 
     // Get language spec
     const CBMLangSpec *spec = cbm_lang_spec(language);

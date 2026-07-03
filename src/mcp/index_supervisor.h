@@ -44,14 +44,25 @@ typedef struct {
     char *response;             /* worker's result string on CLEAN exit (caller frees); else NULL */
 } cbm_index_worker_result_t;
 
-/* Spawn `<self> cli --index-worker index_repository <args_json> --response-out <tmp>
- * [--exclude-file <exclude_file>]`, supervise it (quiet-timeout for hangs), reap,
- * and classify. On a clean exit, result->response holds the worker's response
- * string (read from the temp file). Returns 0 if a worker was spawned and reaped
- * (result filled), or -1 if the child could not be spawned (caller degrades to
- * in-process). exclude_file may be NULL. */
-int cbm_index_spawn_worker(const char *args_json, const char *exclude_file,
-                           cbm_index_worker_result_t *result);
+/* Spawn `<self> cli --index-worker index_repository <args_json> --response-out <tmp>`,
+ * supervise it (quiet-timeout for hangs), reap, and classify. On a clean exit,
+ * result->response holds the worker's response string (read from the temp file).
+ * Returns 0 if a worker was spawned and reaped (result filled), or -1 if the
+ * child could not be spawned (caller degrades to in-process).
+ *
+ * Probe knobs for the skip-and-continue recovery re-run (Stage 3c) are passed to
+ * the child as inherited env vars around the spawn (set before, unset after —
+ * safe because spawns are sequential):
+ *   - single_thread   → CBM_INDEX_SINGLE_THREAD=1: the pipeline uses exactly one
+ *                       worker, so a per-file marker pins the EXACT crasher.
+ *   - marker_file      → CBM_INDEX_MARKER_FILE: the worker writes the rel_path of
+ *                       the file it is about to process here before touching it.
+ *   - quarantine_file  → CBM_INDEX_QUARANTINE_FILE: newline-delimited rel_paths to
+ *                       skip and report as phase="crash".
+ * Any of the three may be false/NULL to leave that knob unset (the normal first
+ * attempt passes single_thread=false, marker_file=NULL, quarantine_file=NULL). */
+int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char *marker_file,
+                           const char *quarantine_file, cbm_index_worker_result_t *result);
 
 void cbm_index_worker_result_free(cbm_index_worker_result_t *result);
 

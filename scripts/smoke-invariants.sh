@@ -707,14 +707,17 @@ inv_garbage_files_cli() {
     fi
 }
 
-# ── Invariant: a hard crash on one file is CONTAINED by the supervisor ──────
-# A file that hard-crashes the native indexer (SIGSEGV/abort/stack-overflow) must
-# not take down the whole process. Uses the test-only fault injector
+# ── Invariant: a hard crash on one file is SKIPPED and the rest is indexed ──
+# Stage 3c skip-and-continue: a file that hard-crashes the native indexer
+# (SIGSEGV/abort/stack-overflow) must be QUARANTINED — the supervisor re-runs the
+# worker single-threaded, pins the exact crasher via a per-file marker, adds it to
+# a quarantine list, and re-spawns until a clean run indexes the GOOD files while
+# reporting the crasher as a phase="crash" skip. Uses the test-only fault injector
 # (CBM_TEST_CRASH_ON) so the guard is honest: with the supervisor OFF the crash
-# must genuinely escape as a signal (rc>=128), and with it ON (default) the crash
-# must be contained (rc<128) and reported (outcome=crash). If the baseline does
-# not crash, the injector is inactive and the guard would be vacuous → fail.
-inv_crasher_contained_cli() {
+# must genuinely escape as a signal (rc>=128, vacuity guard); with it ON (default)
+# the run must be contained (rc<128), report status="indexed" + the crasher as
+# phase="crash", index the good file (nodes>0), and NOT skip the good file.
+inv_crasher_skipped_cli() {
     local crepo="$SCRATCH/crasher_repo"
     mkdir -p "$crepo"
     printf 'def good():\n    return 1\n' > "$crepo/good.py"
@@ -729,22 +732,40 @@ inv_crasher_contained_cli() {
     local base_rc="$CLI_RC"
     unset CBM_INDEX_SUPERVISOR
 
-    # Supervisor ON (default) → the crash must be contained and reported.
-    cli_call 60 index_repository "{\"repo_path\":\"$cn\"}"
+    # Supervisor ON (default) → the crash must be contained AND skipped-and-continued.
+    cli_call 90 index_repository "{\"repo_path\":\"$cn\"}"
     local sup_rc="$CLI_RC"
     local sup_out="$CLI_OUT"
     unset CBM_TEST_CRASH_ON
 
+    # Strip JSON escaping so the assertions are robust to the text-result wrapping.
+    local flat
+    flat="$(printf '%s' "$sup_out" | tr -d '\\' | tr -d '"')"
+    local nodes
+    nodes="$(printf '%s' "$sup_out" | "$PY" -c '
+import sys,re
+t=sys.stdin.read().replace("\\","").replace("\"","")
+m=re.findall(r"nodes\s*[:=]\s*(\d+)", t)
+print(max((int(x) for x in m), default=0))' 2>/dev/null)"
+
     if [ "$base_rc" -le 128 ]; then
-        fail "crasher-contained-cli" "baseline did not crash (rc=$base_rc) — injector inactive, guard would be vacuous"
+        fail "crasher-skipped-cli" "baseline did not crash (rc=$base_rc) — injector inactive, guard would be vacuous"
     elif [ "$sup_rc" -eq 124 ]; then
-        fail "crasher-contained-cli" "supervised run hung (rc=124)"
+        fail "crasher-skipped-cli" "supervised run hung (rc=124)"
     elif [ "$sup_rc" -gt 128 ]; then
-        fail "crasher-contained-cli" "crash escaped the supervisor (signal $((sup_rc-128)))"
-    elif ! printf '%s' "$sup_out" | grep -q '"outcome":"crash"'; then
-        fail "crasher-contained-cli" "crash not reported (no outcome=crash): $sup_out"
+        fail "crasher-skipped-cli" "crash escaped the supervisor (signal $((sup_rc-128)))"
+    elif ! printf '%s' "$flat" | grep -q 'status:indexed'; then
+        fail "crasher-skipped-cli" "status not indexed after skip-and-continue: $(printf '%s' "$sup_out" | tr '\n' ' ' | cut -c1-300)"
+    elif ! printf '%s' "$flat" | grep -q 'phase:crash'; then
+        fail "crasher-skipped-cli" "crasher not reported as phase=crash: $(printf '%s' "$sup_out" | tr '\n' ' ' | cut -c1-300)"
+    elif ! printf '%s' "$flat" | grep -q 'crash_me.py'; then
+        fail "crasher-skipped-cli" "crash_me.py not listed as skipped: $(printf '%s' "$sup_out" | tr '\n' ' ' | cut -c1-300)"
+    elif printf '%s' "$flat" | grep -q 'good.py'; then
+        fail "crasher-skipped-cli" "good.py was skipped (should have been indexed): $(printf '%s' "$sup_out" | tr '\n' ' ' | cut -c1-300)"
+    elif [ "${nodes:-0}" -le 0 ] 2>/dev/null; then
+        fail "crasher-skipped-cli" "good file not indexed (nodes=${nodes:-0}): $(printf '%s' "$sup_out" | tr '\n' ' ' | cut -c1-300)"
     else
-        pass "crasher-contained-cli (baseline rc=$base_rc escaped; supervised rc=$sup_rc contained + reported)"
+        pass "crasher-skipped-cli (baseline rc=$base_rc escaped; supervised rc=$sup_rc: status=indexed, crash_me.py phase=crash, good.py indexed nodes=$nodes)"
     fi
 }
 
@@ -882,7 +903,7 @@ inv_index_status_cli
 inv_nonexistent_repo_cli
 inv_empty_repo_cli
 inv_garbage_files_cli
-inv_crasher_contained_cli
+inv_crasher_skipped_cli
 
 # MCP server-lifecycle invariants (one shared server instance).
 inv_mcp_initialize

@@ -666,6 +666,20 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         const cbm_file_info_t *fi = &ec->files[file_idx];
         pp_err_list_t *errs = ec->err_lists ? &ec->err_lists[worker_id] : NULL;
 
+        /* Crash-quarantine skip (Stage 3c): a file the supervisor pinned as a
+         * crasher must never be extracted again. Record it as a phase="crash"
+         * skip in this worker's list (merged into the pipeline's file-error list
+         * later, surfacing in skipped[]) and move on — the good files still
+         * index and status stays "indexed". No-op unless the supervisor set
+         * CBM_INDEX_QUARANTINE_FILE. Covers the parallel path; the supervisor's
+         * single-threaded recovery run instead takes the sequential path
+         * (pass_definitions.c), and cbm_extract_file's hard guard backstops both. */
+        if (cbm_index_is_quarantined(fi->rel_path)) {
+            pp_err_add(errs, fi->rel_path, "quarantined after crash", "crash");
+            ws->errors++;
+            continue;
+        }
+
         /* Read + extract */
         int source_len = 0;
         long file_size = 0;
