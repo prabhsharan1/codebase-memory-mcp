@@ -15284,6 +15284,80 @@ TEST(seal_py_shared_registry_readonly) {
     PASS();
 }
 
+/* Sibling of seal_py_shared_registry_readonly at the FIELD-ARRAY granularity.
+ *
+ * The count-based seal tests only catch mutations routed through
+ * cbm_registry_add_func/_type (which the read_only seal no-ops). But
+ * py_register_instance_field (py_lsp.c:495), invoked from the `self.x = ...`
+ * assignment handler (py_lsp.c:1616), writes the registered type's
+ * field_names/field_types arrays DIRECTLY (py_lsp.c:517 in-place; :543-544 pointer
+ * reassign) with NO read_only guard — bypassing the seal. In the fused parallel
+ * resolve path pass_parallel.c:2726 hands EVERY worker the one shared, finalized,
+ * read_only registry (pipeline.c:901 → cbm_py_build_cross_registry), so this is a
+ * cross-thread data race AND a cross-file dangling pointer (the appended arrays are
+ * allocated in the per-file resolve arena, freed when that file completes) into a
+ * sealed registry. func_count/type_count stay put, which is exactly why the sibling
+ * test above stays green while the bug persists.
+ *
+ * INVARIANT (green <=> fixed): resolving a `self.x = ...` method body against the
+ * sealed shared registry leaves the class's field arrays byte-identical. RED today
+ * (new field "x" is appended → field_names pointer + count both change); GREEN once
+ * py_register_instance_field honors ctx->registry->read_only. */
+TEST(seal_py_shared_registry_readonly_fields) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+
+    /* One Python class Foo (+ method m) so the shared registry holds a type
+     * "test.mod.Foo" that resolve's self.x= handler will target. */
+    CBMLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.mod.Foo";
+    defs[0].short_name = "Foo";
+    defs[0].label = "Class";
+    defs[0].def_module_qn = "test.mod";
+    defs[0].lang = CBM_LANG_PYTHON;
+    defs[1].qualified_name = "test.mod.Foo.m";
+    defs[1].short_name = "m";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.mod.Foo";
+    defs[1].def_module_qn = "test.mod";
+    defs[1].lang = CBM_LANG_PYTHON;
+
+    CBMTypeRegistry *reg = cbm_py_build_cross_registry(&arena, defs, 2);
+    ASSERT_NOT_NULL(reg);
+    ASSERT_TRUE(reg->read_only);
+
+    /* Snapshot Foo's field arrays before resolve. The entry is stable across
+     * resolve: read_only blocks add_type, so reg->types is never reallocated. */
+    const CBMRegisteredType *rt = cbm_registry_lookup_type(reg, "test.mod.Foo");
+    ASSERT_NOT_NULL(rt);
+    const char **names_before = rt->field_names;
+    int count_before = 0;
+    if (rt->field_names)
+        while (rt->field_names[count_before])
+            count_before++;
+
+    /* A method assigning a NEW instance field on self → the buggy code appends
+     * "x" directly into the sealed registry entry. */
+    const char *src = "class Foo:\n"
+                      "    def m(self):\n"
+                      "        self.x = 1\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_py_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod", reg, NULL, NULL, 0,
+                                       NULL, &out);
+
+    /* The sealed registry entry must be untouched by resolve. */
+    int count_after = 0;
+    if (rt->field_names)
+        while (rt->field_names[count_after])
+            count_after++;
+    ASSERT_EQ(count_after, count_before);
+    ASSERT_TRUE(rt->field_names == names_before);
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 TEST(seal_cs_shared_registry_readonly) {
     CBMArena arena;
     cbm_arena_init(&arena);
@@ -15339,6 +15413,7 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_tier2_shared_registry_readonly_c);
     RUN_TEST(clsp_tier2_shared_registry_readonly_cpp);
     RUN_TEST(seal_py_shared_registry_readonly);
+    RUN_TEST(seal_py_shared_registry_readonly_fields);
     RUN_TEST(seal_cs_shared_registry_readonly);
     RUN_TEST(seal_ts_shared_registry_readonly);
     RUN_TEST(seal_go_shared_registry_readonly);

@@ -98,6 +98,23 @@ typedef struct {
     int eval_steps;                  // per-file work budget used (PY_EVAL_MAX_STEPS_PER_FILE)
     uint32_t eval_truncations;       // depth/budget cutoff count — gates memo inserts
 
+    // Per-file instance-field OVERLAY. When the Tier-2 registry is shared + sealed
+    // (registry->read_only), `self.x = ...` / PEP-526 field discoveries made during
+    // resolve are recorded HERE instead of mutating the shared registry (which would
+    // bypass the add_* seal, race the other resolve workers, and leave the shared
+    // entry pointing into this file's arena once it is freed). py_lookup_field
+    // consults this overlay alongside the shared base, so same-file attribute-chain
+    // resolution is preserved with zero shared mutation. Arena-allocated (per-file
+    // lifetime); holds no pointer into the shared registry, and the shared registry
+    // holds none into it. Mutable per-file registries keep the direct write.
+    struct {
+        const char *class_qn;
+        const char *field_name;
+        const CBMType *field_type;
+    } *field_overlay;
+    int field_overlay_count;
+    int field_overlay_cap;
+
     // Debug mode (CBM_LSP_DEBUG env, shared across all language LSPs).
     bool debug;
 } PyLSPContext;
