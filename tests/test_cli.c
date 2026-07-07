@@ -3010,11 +3010,38 @@ TEST(cli_print_tool_help_issue680) {
     PASS();
 }
 
+/* The self-update path verifies a downloaded archive against a published
+ * checksum. That check is only meaningful if the digest is actually computed —
+ * a broken hash command (it once invoked `shasum -a CBM_SZ_256`, an invalid
+ * algorithm, from a bad macro rename inside the shell string) makes every
+ * digest fail, and the caller then falls through and installs unverified.
+ * Guard the digest itself against a known vector. */
+extern int cbm_cli_sha256_file(const char *path, char *out, size_t out_size);
+
+TEST(cli_sha256_file_matches_known_vector) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/cbm_sha_XXXXXX", cbm_tmpdir());
+    int fd = cbm_mkstemp(path);
+    ASSERT_TRUE(fd >= 0);
+    FILE *fp = fdopen(fd, "wb");
+    ASSERT_NOT_NULL(fp);
+    fwrite("abc", 1, 3, fp); /* sha256("abc") is a NIST test vector */
+    fclose(fp);
+
+    char digest[128] = {0};
+    int rc = cbm_cli_sha256_file(path, digest, sizeof(digest));
+    remove(path);
+    ASSERT_EQ(rc, 0);
+    ASSERT_STR_EQ(digest, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Suite definition
  * ═══════════════════════════════════════════════════════════════════ */
 
 SUITE(cli) {
+    RUN_TEST(cli_sha256_file_matches_known_vector);
     /* Version (2 tests — selfupdate_test.go) */
     RUN_TEST(cli_compare_versions);
     RUN_TEST(cli_version_get_set);

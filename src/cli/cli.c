@@ -2968,15 +2968,16 @@ static bool prompt_yn(const char *question) {
 /* Minimum line length in checksums.txt: CBM_SZ_64 hex + 2 spaces + 1 char filename */
 #define CHECKSUM_LINE_MIN (SHA256_HEX_LEN + 2)
 
-/* Compute SHA-CBM_SZ_256 of a file using platform tools (sha256sum/shasum).
- * Writes CBM_SZ_64-char hex digest + NUL to out. Returns 0 on success. */
-static int sha256_file(const char *path, char *out, size_t out_size) {
+/* Compute the SHA-256 of a file using platform tools (sha256sum/shasum).
+ * Writes a 64-char hex digest + NUL to out. Returns 0 on success. Not static:
+ * exercised directly by the self-update checksum regression test. */
+int cbm_cli_sha256_file(const char *path, char *out, size_t out_size) {
     if (out_size < SHA256_BUF_SIZE) {
         return CLI_ERR;
     }
     char cmd[CLI_BUF_1K];
 #ifdef __APPLE__
-    snprintf(cmd, sizeof(cmd), "shasum -a CBM_SZ_256 '%s' 2>/dev/null", path);
+    snprintf(cmd, sizeof(cmd), "shasum -a 256 '%s' 2>/dev/null", path);
 #else
     snprintf(cmd, sizeof(cmd), "sha256sum '%s' 2>/dev/null", path);
 #endif
@@ -3107,8 +3108,8 @@ static int verify_download_checksum(const char *archive_path, const char *archiv
     }
 
     char actual[SHA256_BUF_SIZE] = {0};
-    if (sha256_file(archive_path, actual, sizeof(actual)) != 0) {
-        (void)fprintf(stderr, "warning: sha256sum/shasum not available — skipping verification\n");
+    if (cbm_cli_sha256_file(archive_path, actual, sizeof(actual)) != 0) {
+        (void)fprintf(stderr, "error: could not compute checksum (sha256 tool unavailable)\n");
         return CLI_ERR;
     }
 
@@ -4250,8 +4251,12 @@ static int download_verify_install(const char *url, const char *ext, const char 
     const char *portable = (strcmp(os, "linux") == 0) ? "-portable" : "";
     snprintf(archive_name, sizeof(archive_name), "codebase-memory-mcp-%s%s-%s%s.%s",
              want_ui ? "ui-" : "", os, arch, portable, ext);
+    /* Fail closed: install only a positively-verified download. A mismatch,
+     * a missing checksum entry, or an unavailable hash tool (crc != 0) all
+     * abort rather than install an unverified binary. */
     int crc = verify_download_checksum(tmp_archive, archive_name);
-    if (crc == CLI_TRUE) {
+    if (crc != 0) {
+        (void)fprintf(stderr, "error: refusing to install an unverified download\n");
         cbm_unlink(tmp_archive);
         return CLI_TRUE;
     }
