@@ -1897,6 +1897,19 @@ static void cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
         cbm_store_free_coverage(rows, count);
         return;
     }
+    /* Only FAILURE rows materialize in the miss graph; a project whose only
+     * coverage rows are by-design not_indexed_* entries gets NO graph (not
+     * even a bare root node). */
+    int failure_count = 0;
+    for (int i = 0; i < count; i++) {
+        if (!rows[i].kind || strncmp(rows[i].kind, "not_indexed", 11) != 0) {
+            failure_count++;
+        }
+    }
+    if (failure_count == 0) {
+        cbm_store_free_coverage(rows, count);
+        return;
+    }
 
     /* nodes.project has an FK to projects(name) (enforced: foreign_keys=ON),
      * so the shadow project needs its row. Invisible to list_projects, which
@@ -1916,6 +1929,12 @@ static void cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
     for (int i = 0; i < count; i++) {
         const char *rel = rows[i].rel_path;
         if (!rel || !rel[0] || root_id <= 0) {
+            continue;
+        }
+        /* The missed graph shows FAILURES ("we did not manage") only —
+         * by-design not_indexed_* rows stay out of it, so the UI's
+         * report-an-edge-case callout never fires for gitignored paths. */
+        if (rows[i].kind && strncmp(rows[i].kind, "not_indexed", 11) == 0) {
             continue;
         }
         char pathbuf[CBM_SZ_1K];
@@ -2024,11 +2043,15 @@ int cbm_store_coverage_replace(cbm_store_t *s, const char *project, const cbm_co
         sqlite3_reset(ins);
     }
     sqlite3_finalize(ins);
-    /* Prune rows for files no longer known to the index (deleted from the
-     * repo): file_hashes is the authoritative live-file set after persist. */
+    /* Prune FAILURE rows for files no longer known to the index (deleted from
+     * the repo): file_hashes is the authoritative live-file set after
+     * persist. By-design not_indexed_* rows are exempt — deliberately
+     * unindexed paths never have hash rows (discovery rewrites them fresh
+     * every run instead). */
     sqlite3_stmt *prune = NULL;
     if (sqlite3_prepare_v2(s->db,
-                           "DELETE FROM index_coverage WHERE project = ?1 AND rel_path NOT IN "
+                           "DELETE FROM index_coverage WHERE project = ?1 "
+                           "AND kind NOT LIKE 'not_indexed%' AND rel_path NOT IN "
                            "(SELECT rel_path FROM file_hashes WHERE project = ?1);",
                            CBM_NOT_FOUND, &prune, NULL) == SQLITE_OK) {
         bind_text(prune, SKIP_ONE, project);

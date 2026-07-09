@@ -18,6 +18,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "discover/discover.h" /* cbm_ignored_file_t (#963) */
+
 /* Forward declarations */
 typedef struct cbm_store cbm_store_t;
 typedef struct cbm_gbuf cbm_gbuf_t;
@@ -116,6 +118,13 @@ void cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char
  * cbm_pipeline_free()). out and count are set to NULL and 0 when p is NULL or
  * nothing was skipped. Do not free. */
 void cbm_pipeline_get_file_errors(const cbm_pipeline_t *p, cbm_file_error_t **out, int *count);
+
+/* Borrowed accessor for the individually-ignored files captured during
+ * discovery (#963 "purposely not indexed" — by design, not failures). count
+ * is the stored (capped) length, total the uncapped number seen. Do not
+ * free. */
+void cbm_pipeline_get_ignored(const cbm_pipeline_t *p, cbm_ignored_file_t **out, int *count,
+                              int *total);
 
 /* ── Index lock (prevents concurrent pipeline runs on same DB) ──── */
 

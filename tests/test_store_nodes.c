@@ -1606,20 +1606,35 @@ TEST(store_coverage_roundtrip_prune_shadow) {
     cbm_coverage_row_t rows[] = {
         {.rel_path = "src/a.py", .kind = "parse_partial", .detail = "4-7"},
         {.rel_path = "gone.py", .kind = "oversized", .detail = "too big"},
+        /* By-design rows (#963): neither has a file_hashes row, yet both must
+         * SURVIVE the deleted-file prune (deliberately-unindexed paths never
+         * have hashes) — and must stay OUT of the shadow miss graph. */
+        {.rel_path = "secret.py", .kind = "not_indexed_file", .detail = "gitignore"},
+        {.rel_path = "generated", .kind = "not_indexed_dir", .detail = "excluded subtree"},
     };
-    ASSERT_EQ(cbm_store_coverage_replace(s, "test", rows, 2), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_coverage_replace(s, "test", rows, 4), CBM_STORE_OK);
 
     cbm_coverage_row_t *got = NULL;
     int n = 0;
     ASSERT_EQ(cbm_store_coverage_get(s, "test", &got, &n), CBM_STORE_OK);
-    ASSERT_EQ(n, 1); /* gone.py pruned — no file_hashes row */
-    ASSERT_STR_EQ(got[0].rel_path, "src/a.py");
-    ASSERT_STR_EQ(got[0].kind, "parse_partial");
-    ASSERT_STR_EQ(got[0].detail, "4-7");
+    ASSERT_EQ(n, 3); /* gone.py pruned — no file_hashes row; by-design rows kept */
+    int saw_partial = 0;
+    int saw_by_design = 0;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(got[i].kind, "parse_partial") == 0) {
+            saw_partial++;
+        }
+        if (strncmp(got[i].kind, "not_indexed", 11) == 0) {
+            saw_by_design++;
+        }
+    }
+    ASSERT_EQ(saw_partial, 1);
+    ASSERT_EQ(saw_by_design, 2);
     cbm_store_free_coverage(got, n);
 
-    /* Shadow miss-graph materialized under "test::missed":
-     * Project → Folder(src) → File(a.py){kind,detail}. */
+    /* Shadow miss-graph materialized under "test::missed": FAILURES only —
+     * Project → Folder(src) → File(a.py){kind,detail}; the by-design rows do
+     * not appear. */
     cbm_node_t *nodes = NULL;
     int nc = 0;
     ASSERT_EQ(cbm_store_find_nodes_by_label(s, "test::missed", "File", &nodes, &nc), CBM_STORE_OK);

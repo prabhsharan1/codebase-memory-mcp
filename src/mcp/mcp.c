@@ -322,7 +322,9 @@ static const tool_def_t TOOLS[] = {
      "constructs inside the listed line ranges could not be parsed and MAY be missing from "
      "the graph). Query the persisted signal any time via index_status or "
      "structurally via query_graph(graph=\"missed\"). Both signals are best-effort: absence "
-     "of a flag is NOT a completeness guarantee; prefer grep inside flagged ranges.",
+     "of a flag is NOT a completeness guarantee; prefer grep inside flagged ranges. "
+     "Separately, 'excluded' + 'not_indexed_files' list what was deliberately NOT indexed "
+     "(gitignore/.cbmignore/skip-lists) — by design, not failures.",
      "{\"type\":\"object\",\"properties\":{\"repo_path\":{\"type\":\"string\",\"description\":"
      "\"Path to the repository\"},"
      "\"mode\":{\"type\":\"string\","
@@ -507,7 +509,9 @@ static const tool_def_t TOOLS[] = {
      "trusting graph completeness on a file: if a file is listed, ALSO grep it (especially the "
      "flagged ranges). IMPORTANT: absence from these lists is NOT a completeness guarantee — the "
      "signal only marks what the indexer can detect. For structural queries over the misses use "
-     "query_graph(graph=\"missed\").",
+     "query_graph(graph=\"missed\"). The report also carries 'not_indexed' — files/dirs excluded "
+     "BY DESIGN (gitignore/.cbmignore/skip-lists): deliberate and deterministic, not failures; "
+     "change the ignore rules and re-index to include them.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
      "\"project\"]}"},
 
@@ -2191,11 +2195,15 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
 
     yyjson_mut_val *pp_files = yyjson_mut_arr(doc);
     yyjson_mut_val *sk_files = yyjson_mut_arr(doc);
+    yyjson_mut_val *ni_dirs = yyjson_mut_arr(doc);
+    yyjson_mut_val *ni_files = yyjson_mut_arr(doc);
     int pp_n = 0;
     int sk_n = 0;
+    int ni_dir_n = 0;
+    int ni_file_n = 0;
     for (int i = 0; i < count; i++) {
-        bool partial = rows[i].kind && strcmp(rows[i].kind, "parse_partial") == 0;
-        if (partial) {
+        const char *kind = rows[i].kind ? rows[i].kind : "";
+        if (strcmp(kind, "parse_partial") == 0) {
             if (pp_n < COVERAGE_FILE_CAP) {
                 yyjson_mut_val *fe = yyjson_mut_obj(doc);
                 yyjson_mut_obj_add_strcpy(doc, fe, "path", rows[i].rel_path);
@@ -2204,6 +2212,19 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
                 yyjson_mut_arr_add_val(pp_files, fe);
             }
             pp_n++;
+        } else if (strcmp(kind, "not_indexed_dir") == 0) {
+            if (ni_dir_n < COVERAGE_FILE_CAP) {
+                yyjson_mut_arr_add_strcpy(doc, ni_dirs, rows[i].rel_path);
+            }
+            ni_dir_n++;
+        } else if (strcmp(kind, "not_indexed_file") == 0) {
+            if (ni_file_n < COVERAGE_FILE_CAP) {
+                yyjson_mut_val *fe = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, fe, "path", rows[i].rel_path);
+                yyjson_mut_obj_add_strcpy(doc, fe, "reason", rows[i].detail ? rows[i].detail : "");
+                yyjson_mut_arr_add_val(ni_files, fe);
+            }
+            ni_file_n++;
         } else {
             if (sk_n < COVERAGE_FILE_CAP) {
                 yyjson_mut_val *fe = yyjson_mut_obj(doc);
@@ -2229,6 +2250,25 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
     yyjson_mut_obj_add_bool(doc, sk, "truncated", sk_n > COVERAGE_FILE_CAP);
     yyjson_mut_obj_add_val(doc, root, "skipped", sk);
 
+    /* By-design exclusions (#963 "purposely not indexed"): a deliberate,
+     * deterministic class — NOT a failure and NOT best-effort. Dirs are
+     * exhaustive; per-file entries are capped in discovery (2000) with the
+     * truncation explicit. */
+    yyjson_mut_val *ni = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_val(doc, ni, "dirs", ni_dirs);
+    yyjson_mut_obj_add_int(doc, ni, "dirs_count", ni_dir_n);
+    yyjson_mut_obj_add_val(doc, ni, "files", ni_files);
+    yyjson_mut_obj_add_int(doc, ni, "files_count", ni_file_n);
+    yyjson_mut_obj_add_bool(doc, ni, "truncated",
+                            ni_dir_n > COVERAGE_FILE_CAP || ni_file_n > COVERAGE_FILE_CAP);
+    if (ni_dir_n > 0 || ni_file_n > 0) {
+        yyjson_mut_obj_add_str(doc, ni, "note",
+                               "Purposely not indexed — excluded BY DESIGN via "
+                               "gitignore/.cbmignore/skip-lists (see each file's reason). Not an "
+                               "error: change the ignore rules and re-index to include them.");
+    }
+    yyjson_mut_obj_add_val(doc, root, "not_indexed", ni);
+
     if (pp_n > 0 || sk_n > 0) {
         yyjson_mut_obj_add_str(
             doc, root, "coverage_note",
@@ -2236,7 +2276,8 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
             "but constructs inside the listed line ranges (1-based) MAY be missing from the graph "
             "(tree-sitter error recovery still salvages some). skipped files were not indexed at "
             "all. Prefer text search (grep) for flagged files/ranges. Files absent from this list "
-            "are NOT guaranteed to be fully indexed.");
+            "are NOT guaranteed to be fully indexed. (not_indexed entries are a separate, "
+            "BY-DESIGN class — deliberate ignore rules, not failures.)");
     }
 }
 
@@ -3409,6 +3450,41 @@ static void add_excluded_summary(yyjson_mut_doc *doc, yyjson_mut_val *root, char
  * the JSON carries "count" + "truncated" so nothing is silently hidden. */
 enum { INDEX_SKIPPED_FILE_CAP = 50 };
 
+/* Attach the by-design ignored-FILES summary (#963 "purposely not indexed").
+ * Individual files dropped by ignore rules — deliberate, not failures; whole
+ * excluded subtrees are reported separately via "excluded". Always emits
+ * "not_indexed_files_count" (the uncapped total); the list itself is capped
+ * like skipped[] and marked truncated when discovery hit its storage cap. */
+static void add_not_indexed_files_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                          cbm_pipeline_t *p) {
+    cbm_ignored_file_t *ignored = NULL;
+    int stored = 0;
+    int total = 0;
+    cbm_pipeline_get_ignored(p, &ignored, &stored, &total);
+    yyjson_mut_obj_add_int(doc, root, "not_indexed_files_count", total);
+    if (!ignored || stored <= 0) {
+        return;
+    }
+    yyjson_mut_val *ni = yyjson_mut_obj(doc);
+    yyjson_mut_val *files = yyjson_mut_arr(doc);
+    int shown = stored < INDEX_SKIPPED_FILE_CAP ? stored : INDEX_SKIPPED_FILE_CAP;
+    for (int i = 0; i < shown; i++) {
+        yyjson_mut_val *fe = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, fe, "path", ignored[i].rel_path ? ignored[i].rel_path : "");
+        yyjson_mut_obj_add_strcpy(doc, fe, "reason", ignored[i].reason ? ignored[i].reason : "");
+        yyjson_mut_arr_add_val(files, fe);
+    }
+    yyjson_mut_obj_add_val(doc, ni, "files", files);
+    yyjson_mut_obj_add_int(doc, ni, "count", total);
+    yyjson_mut_obj_add_bool(doc, ni, "truncated", total > shown);
+    yyjson_mut_obj_add_str(doc, ni, "note",
+                           "Purposely not indexed — excluded BY DESIGN via "
+                           "gitignore/.cbmignore/skip-lists (see each file's reason). Not an "
+                           "error: change the ignore rules and re-index to include them. Whole "
+                           "excluded subtrees are listed separately under \"excluded\".");
+    yyjson_mut_obj_add_val(doc, root, "not_indexed_files", ni);
+}
+
 /* True when a recorded per-file entry is the parse-partial coverage signal
  * (#963) rather than a genuine skip. Kept out of skipped[]/skipped_count so
  * the "skipped" contract (file NOT indexed) stays exact. */
@@ -3567,6 +3643,7 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     add_excluded_summary(doc, root, excluded_dirs, excluded_count);
     add_skipped_summary(doc, root, file_errors, file_error_count, logfile);
     add_parse_partial_summary(doc, root, file_errors, file_error_count);
+    add_not_indexed_files_summary(doc, root, p);
 
     int exp_nodes = -1;
     int exp_edges = -1;

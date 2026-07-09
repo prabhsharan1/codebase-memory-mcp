@@ -858,19 +858,29 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_pipeline_pass_k8s(&ctx, changed_files, ci);
     run_postpasses(&ctx, changed_files, ci, project);
 
-    /* Coverage rows (#963): merge = previous rows for files NOT re-extracted
-     * this run + this run's fresh entries (changed files replace their old
-     * rows — a file that parses cleanly now simply contributes nothing, so
-     * its stale flag dies here). Rows for deleted files are pruned against
-     * file_hashes inside the replace. Borrowed strings: old_cov and the
-     * pipeline own them past the dump_and_persist call below. */
+    /* Coverage rows (#963): merge = previous FAILURE rows for files NOT
+     * re-extracted this run + this run's fresh entries (changed files replace
+     * their old rows — a file that parses cleanly now simply contributes
+     * nothing, so its stale flag dies here). By-design not_indexed_* rows are
+     * NOT carried over: discovery runs completely on every route, so this
+     * run's excluded dirs + ignored files are the fresh, authoritative set.
+     * Rows for deleted files are pruned against file_hashes inside the
+     * replace. Borrowed strings: old_cov and the pipeline own them past the
+     * dump_and_persist call below. */
     cbm_file_error_t *run_errs = NULL;
     int run_err_count = 0;
     cbm_pipeline_get_file_errors(p, &run_errs, &run_err_count);
+    char **run_excluded = NULL;
+    int run_excluded_count = 0;
+    cbm_pipeline_get_excluded(p, &run_excluded, &run_excluded_count);
+    cbm_ignored_file_t *run_ignored = NULL;
+    int run_ignored_count = 0;
+    cbm_pipeline_get_ignored(p, &run_ignored, &run_ignored_count, NULL);
     cbm_coverage_row_t *cov = NULL;
     int cov_n = 0;
-    if (old_cov_count + run_err_count > 0) {
-        cov = (cbm_coverage_row_t *)malloc((size_t)(old_cov_count + run_err_count) * sizeof(*cov));
+    int cov_cap = old_cov_count + run_err_count + run_excluded_count + run_ignored_count;
+    if (cov_cap > 0) {
+        cov = (cbm_coverage_row_t *)malloc((size_t)cov_cap * sizeof(*cov));
     }
     if (cov) {
         CBMHashTable *changed_set = cbm_ht_create(ci > 0 ? (size_t)ci * PAIR_LEN : CBM_SZ_64);
@@ -878,7 +888,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
             cbm_ht_set(changed_set, changed_files[i].rel_path, &changed_files[i]);
         }
         for (int i = 0; i < old_cov_count; i++) {
-            if (old_cov[i].rel_path && !cbm_ht_get(changed_set, old_cov[i].rel_path)) {
+            bool by_design = old_cov[i].kind && strncmp(old_cov[i].kind, "not_indexed", 11) == 0;
+            if (!by_design && old_cov[i].rel_path &&
+                !cbm_ht_get(changed_set, old_cov[i].rel_path)) {
                 cov[cov_n++] = old_cov[i];
             }
         }
@@ -887,6 +899,18 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
             cov[cov_n].rel_path = run_errs[i].path;
             cov[cov_n].kind = run_errs[i].phase;
             cov[cov_n].detail = run_errs[i].reason;
+            cov_n++;
+        }
+        for (int i = 0; i < run_excluded_count; i++) {
+            cov[cov_n].rel_path = run_excluded[i];
+            cov[cov_n].kind = "not_indexed_dir";
+            cov[cov_n].detail = "excluded subtree";
+            cov_n++;
+        }
+        for (int i = 0; i < run_ignored_count; i++) {
+            cov[cov_n].rel_path = run_ignored[i].rel_path;
+            cov[cov_n].kind = "not_indexed_file";
+            cov[cov_n].detail = run_ignored[i].reason;
             cov_n++;
         }
     }

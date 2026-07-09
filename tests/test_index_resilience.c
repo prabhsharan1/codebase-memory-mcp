@@ -514,9 +514,147 @@ TEST(index_parse_partial_clears_on_fix) {
     PASS();
 }
 
+/* INV(not-indexed-by-design, #963): files/dirs dropped by ignore rules are a
+ * deliberate, deterministic class — reported as such and NEVER mixed into the
+ * failure surfaces:
+ *   - response: "not_indexed_files" lists the gitignored file with its reason
+ *     and the by-design note; "excluded" lists the ignored dir; the failure
+ *     surfaces stay clean (skipped_count == 0, parse_partial_count == 0),
+ *   - index_status: "not_indexed" carries dirs + files with the note,
+ *   - the missed graph (failures only) does NOT contain them — the UI's
+ *     report-an-edge-case callout must never fire for gitignored paths,
+ *   - the persisted rows survive a re-index (the deleted-file prune must not
+ *     eat them — deliberately-unindexed paths have no file_hashes rows). */
+TEST(index_not_indexed_by_design_reported) {
+    RProj lp;
+    memset(&lp, 0, sizeof(lp));
+    snprintf(lp.tmpdir, sizeof(lp.tmpdir), "/tmp/cbm_resil_XXXXXX");
+    if (!cbm_mkdtemp(lp.tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    rh_to_fwd_slashes(lp.tmpdir);
+
+    ri_write_text(lp.tmpdir, ".gitignore", "secret.py\ngenerated/\n");
+    ri_write_text(lp.tmpdir, "good.py", "def alpha():\n    return 1\n");
+    ri_write_text(lp.tmpdir, "secret.py", "def hidden():\n    return 42\n");
+    char gen_dir[700];
+    snprintf(gen_dir, sizeof(gen_dir), "%s/generated", lp.tmpdir);
+    cbm_mkdir(gen_dir);
+    ri_write_text(gen_dir, "gen.py", "def generated():\n    return 3\n");
+
+    char *resp = NULL;
+    cbm_store_t *store = ri_index_capture(&lp, &resp);
+    if (!resp) {
+        FAIL("no MCP response");
+    }
+    if (!store) {
+        free(resp);
+        FAIL("store did not open");
+    }
+
+    yyjson_doc *d = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(d);
+    yyjson_val *sc = yyjson_obj_get(yyjson_doc_get_root(d), "structuredContent");
+    ASSERT_NOT_NULL(sc);
+
+    /* By design ≠ failure: both failure surfaces stay clean. */
+    ASSERT_STR_EQ("indexed", yyjson_get_str(yyjson_obj_get(sc, "status")));
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(sc, "skipped_count")), 0);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(sc, "parse_partial_count")), 0);
+
+    /* The gitignored FILE is listed with its reason + the by-design note. */
+    ASSERT_GTE(yyjson_get_int(yyjson_obj_get(sc, "not_indexed_files_count")), 1);
+    yyjson_val *ni = yyjson_obj_get(sc, "not_indexed_files");
+    ASSERT_NOT_NULL(ni);
+    yyjson_val *files = yyjson_obj_get(ni, "files");
+    ASSERT_NOT_NULL(files);
+    int found_secret = 0;
+    size_t idx = 0;
+    size_t fmax = 0;
+    yyjson_val *fe = NULL;
+    yyjson_arr_foreach(files, idx, fmax, fe) {
+        const char *fp = yyjson_get_str(yyjson_obj_get(fe, "path"));
+        const char *reason = yyjson_get_str(yyjson_obj_get(fe, "reason"));
+        if (fp && strcmp(fp, "secret.py") == 0) {
+            found_secret = 1;
+            ASSERT_NOT_NULL(reason);
+            ASSERT_STR_EQ("gitignore", reason);
+        }
+    }
+    ASSERT_TRUE(found_secret);
+    const char *note = yyjson_get_str(yyjson_obj_get(ni, "note"));
+    ASSERT_NOT_NULL(note);
+    ASSERT_NOT_NULL(strstr(note, "BY DESIGN"));
+
+    /* The gitignored DIR is in the excluded subtrees list. */
+    yyjson_val *excluded = yyjson_obj_get(sc, "excluded");
+    ASSERT_NOT_NULL(excluded);
+    char *excl_json = yyjson_val_write(excluded, 0, NULL);
+    ASSERT_NOT_NULL(excl_json);
+    ASSERT_NOT_NULL(strstr(excl_json, "generated"));
+    free(excl_json);
+
+    /* index_status carries the persisted by-design section. */
+    char qargs[900];
+    snprintf(qargs, sizeof(qargs), "{\"project\":\"%s\"}", lp.project);
+    char *sresp = cbm_mcp_handle_tool(lp.srv, "index_status", qargs);
+    ASSERT_NOT_NULL(sresp);
+    ASSERT_NOT_NULL(strstr(sresp, "not_indexed"));
+    ASSERT_NOT_NULL(strstr(sresp, "secret.py"));
+    ASSERT_NOT_NULL(strstr(sresp, "generated"));
+    ASSERT_NOT_NULL(strstr(sresp, "BY DESIGN"));
+    free(sresp);
+
+    /* The missed graph shows FAILURES only — no by-design paths, so the UI
+     * callout can never fire for them. */
+    snprintf(qargs, sizeof(qargs),
+             "{\"project\":\"%s\",\"graph\":\"missed\",\"query\":\"MATCH (f) RETURN "
+             "f.file_path\"}",
+             lp.project);
+    char *gresp = cbm_mcp_handle_tool(lp.srv, "query_graph", qargs);
+    ASSERT_NOT_NULL(gresp);
+    ASSERT_NULL(strstr(gresp, "secret.py"));
+    ASSERT_NULL(strstr(gresp, "generated"));
+    free(gresp);
+
+    /* Re-index (DB exists → incremental route): the by-design rows survive
+     * the rebuild + deleted-file prune and stay fresh. */
+    char iargs[700];
+    snprintf(iargs, sizeof(iargs), "{\"repo_path\":\"%s\"}", lp.tmpdir);
+    char *resp2 = cbm_mcp_handle_tool(lp.srv, "index_repository", iargs);
+    ASSERT_NOT_NULL(resp2);
+    free(resp2);
+    char *sresp2 = cbm_mcp_handle_tool(lp.srv, "index_status", qargs);
+    ASSERT_NOT_NULL(sresp2);
+    ASSERT_NOT_NULL(strstr(sresp2, "secret.py"));
+    ASSERT_NOT_NULL(strstr(sresp2, "generated"));
+    free(sresp2);
+
+    /* The ignored constructs are genuinely absent from the graph (label
+     * counts include <python-builtins> stubs, so assert by name). */
+    cbm_node_t *hits = NULL;
+    int hit_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, lp.project, "hidden", &hits, &hit_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(hit_count, 0);
+    cbm_store_free_nodes(hits, hit_count);
+    hits = NULL;
+    hit_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, lp.project, "alpha", &hits, &hit_count),
+              CBM_STORE_OK);
+    ASSERT_GTE(hit_count, 1); /* the non-ignored neighbor IS indexed */
+    cbm_store_free_nodes(hits, hit_count);
+
+    yyjson_doc_free(d);
+    free(resp);
+    rh_cleanup(&lp, store);
+    PASS();
+}
+
 SUITE(index_resilience) {
     RUN_TEST(index_oversized_file_reported);
     RUN_TEST(index_clean_run_no_logfile);
     RUN_TEST(index_parse_partial_reported);
     RUN_TEST(index_parse_partial_clears_on_fix);
+    RUN_TEST(index_not_indexed_by_design_reported);
 }
