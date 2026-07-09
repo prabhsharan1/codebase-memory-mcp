@@ -621,7 +621,10 @@ const char *cbm_mcp_tool_input_schema(const char *tool_name) {
     return NULL;
 }
 
-static int mcp_tools_cursor_offset(const char *params_json) {
+static int mcp_tools_cursor_offset(const char *params_json, bool *has_cursor_out) {
+    if (has_cursor_out) {
+        *has_cursor_out = false;
+    }
     if (!params_json) {
         return 0;
     }
@@ -635,6 +638,9 @@ static int mcp_tools_cursor_offset(const char *params_json) {
     yyjson_val *root = yyjson_doc_get_root(doc);
     yyjson_val *cursor = root ? yyjson_obj_get(root, "cursor") : NULL;
     if (cursor) {
+        if (has_cursor_out) {
+            *has_cursor_out = true;
+        }
         offset = TOOL_COUNT;
         if (yyjson_is_str(cursor)) {
             const char *cursor_str = yyjson_get_str(cursor);
@@ -654,8 +660,12 @@ static int mcp_tools_cursor_offset(const char *params_json) {
 }
 
 static char *cbm_mcp_tools_list_page(const char *params_json) {
-    return cbm_mcp_tools_list_range(mcp_tools_cursor_offset(params_json), MCP_TOOLS_PAGE_SIZE,
-                                    true);
+    bool has_cursor = false;
+    int offset = mcp_tools_cursor_offset(params_json, &has_cursor);
+    if (!has_cursor) {
+        return cbm_mcp_tools_list();
+    }
+    return cbm_mcp_tools_list_range(offset, MCP_TOOLS_PAGE_SIZE, true);
 }
 
 /* Supported protocol versions, newest first. The server picks the newest

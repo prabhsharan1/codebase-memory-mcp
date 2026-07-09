@@ -586,16 +586,26 @@ TEST(server_handle_tools_list) {
     PASS();
 }
 
-TEST(server_handle_tools_list_paginates) {
+TEST(server_handle_tools_list_defaults_to_all_tools_and_accepts_cursor) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
     char *resp =
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":200,\"method\":\"tools/list\"}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"id\":200"));
-    ASSERT_NOT_NULL(strstr(resp, "\"nextCursor\":\"8\""));
+    ASSERT_NULL(strstr(resp, "\"nextCursor\""));
     ASSERT_NOT_NULL(strstr(resp, "index_repository"));
-    ASSERT_NULL(strstr(resp, "manage_adr"));
+    ASSERT_NOT_NULL(strstr(resp, "manage_adr"));
+    ASSERT_NOT_NULL(strstr(resp, "ingest_traces"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":202,\"method\":\"tools/list\",\"params\":{}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":202"));
+    ASSERT_NULL(strstr(resp, "\"nextCursor\""));
+    ASSERT_NOT_NULL(strstr(resp, "manage_adr"));
+    ASSERT_NOT_NULL(strstr(resp, "ingest_traces"));
     free(resp);
 
     resp = cbm_mcp_server_handle(
@@ -5238,7 +5248,7 @@ SUITE(mcp) {
     RUN_TEST(server_handle_initialize);
     RUN_TEST(server_handle_initialized_notification);
     RUN_TEST(server_handle_tools_list);
-    RUN_TEST(server_handle_tools_list_paginates);
+    RUN_TEST(server_handle_tools_list_defaults_to_all_tools_and_accepts_cursor);
     RUN_TEST(server_handle_logs_request_without_params);
     RUN_TEST(server_handle_unknown_method);
 
