@@ -4874,11 +4874,98 @@ TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853) {
 #endif
 }
 
+/* The containment guard both MCP file-read sinks route through
+ * (resolve_snippet_source for get_code_snippet, attach_result_source for
+ * search_code). A result path that resolves outside the indexed project root
+ * — via a `..` segment or a followed symlink/junction — must be rejected so
+ * its contents never reach a tool response. */
+extern bool cbm_path_within_root(const char *root_path, const char *abs_path);
+
+TEST(mcp_path_within_root_rejects_escape) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX realpath repro; the Windows _fullpath branch is the same guard");
+#else
+    char root[512];
+    snprintf(root, sizeof(root), "%s/cbm_pwr_XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(root)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char inside[700];
+    snprintf(inside, sizeof(inside), "%s/inside.c", root);
+    FILE *fp = fopen(inside, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("int x;\n", fp);
+    fclose(fp);
+
+    /* The abs_path a sink builds for an in-root result stays contained; a `..`
+     * escape to an existing outside file (/etc/hosts) resolves out and must be
+     * rejected. */
+    char escape[900];
+    snprintf(escape, sizeof(escape), "%s/../../../../etc/hosts", root);
+    ASSERT_TRUE(cbm_path_within_root(root, inside));
+    ASSERT_FALSE(cbm_path_within_root(root, escape));
+    ASSERT_FALSE(cbm_path_within_root(root, "/etc/hosts"));
+
+    remove(inside);
+    cbm_rmdir(root);
+    PASS();
+#endif
+}
+
+/* base_branch is spliced into a `git diff --name-only "<base>"...HEAD` command;
+ * a value starting with '-' would be taken by git as an option (e.g.
+ * --output=<path> writes the diff to an arbitrary file) rather than a ref. It
+ * must be rejected up front, alongside the shell-metacharacter check. */
+TEST(detect_changes_rejects_option_like_base_branch) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"detect_changes\","
+             "\"arguments\":{\"project\":\"p\",\"base_branch\":\"--output=/tmp/cbm_pwn\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "invalid characters"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Opt-in workspace boundary: when CBM_ALLOWED_ROOT is set, index_repository
+ * must refuse a repo_path that resolves outside it. Unset (the default) imposes
+ * no restriction. */
+TEST(index_repository_honors_allowed_root) {
+    char allowed[512];
+    snprintf(allowed, sizeof(allowed), "%s/cbm_allowed_XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(allowed)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    cbm_setenv("CBM_ALLOWED_ROOT", allowed, 1);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char args[1024];
+    snprintf(args, sizeof(args),
+             "{\"jsonrpc\":\"2.0\",\"id\":88,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"index_repository\","
+             "\"arguments\":{\"repo_path\":\"%s/../..\"}}}",
+             allowed); /* resolves to a parent, outside the allowed root */
+    char *resp = cbm_mcp_server_handle(srv, args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "outside the allowed root"));
+    free(resp);
+
+    cbm_unsetenv("CBM_ALLOWED_ROOT");
+    cbm_mcp_server_free(srv);
+    cbm_rmdir(allowed);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
 SUITE(mcp) {
+    RUN_TEST(mcp_path_within_root_rejects_escape);
+    RUN_TEST(detect_changes_rejects_option_like_base_branch);
+    RUN_TEST(index_repository_honors_allowed_root);
     /* JSON-RPC parsing */
     RUN_TEST(jsonrpc_parse_request);
     RUN_TEST(jsonrpc_parse_notification);

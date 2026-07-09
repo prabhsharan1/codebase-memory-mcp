@@ -112,7 +112,8 @@ FOUNDATION_SRCS = \
     src/foundation/profile.c \
     src/foundation/dump_verify.c \
     src/foundation/limits.c \
-    src/foundation/subprocess.c
+    src/foundation/subprocess.c \
+    src/foundation/sha256.c
 
 # Existing extraction C code (compiled from current location)
 EXTRACTION_SRCS = \
@@ -316,6 +317,7 @@ TEST_EXTRACTION_SRCS = \
     tests/test_extraction.c \
     tests/test_extraction_inheritance.c \
     tests/test_extraction_imports.c \
+    tests/test_parse_coverage.c \
     tests/test_grammar_regression.c \
     tests/test_grammar_labels.c \
     tests/test_grammar_imports.c \
