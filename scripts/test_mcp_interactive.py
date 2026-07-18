@@ -68,11 +68,11 @@ def drain(stream: BinaryIO, chunks: list[bytes]) -> None:
         chunks.append(chunk)
 
 
-def daemon_log_tail(limit: int = 16384) -> str:
+def cache_log_tail(name: str, limit: int = 16384) -> str:
     cache_dir = os.environ.get("CBM_CACHE_DIR")
     if not cache_dir:
         return ""
-    path = os.path.join(cache_dir, "logs", "cbm-daemon.log")
+    path = os.path.join(cache_dir, "logs", name)
     try:
         with open(path, "rb") as stream:
             stream.seek(0, os.SEEK_END)
@@ -385,7 +385,8 @@ def main() -> int:
     except SmokeFailure as error:
         stop_process(process)
         stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
-        daemon_log = daemon_log_tail()
+        daemon_log = cache_log_tail("cbm-daemon.log")
+        conflicts = cache_log_tail("daemon-conflicts.ndjson")
         print(f"FAIL: {error}", file=sys.stderr)
         if stderr:
             print("--- MCP stderr ---", file=sys.stderr)
@@ -396,6 +397,13 @@ def main() -> int:
                 daemon_log,
                 file=sys.stderr,
                 end="" if daemon_log.endswith("\n") else "\n",
+            )
+        if conflicts:
+            print("--- daemon-conflicts.ndjson (tail) ---", file=sys.stderr)
+            print(
+                conflicts,
+                file=sys.stderr,
+                end="" if conflicts.endswith("\n") else "\n",
             )
         return 1
 

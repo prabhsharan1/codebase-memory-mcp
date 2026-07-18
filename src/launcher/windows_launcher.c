@@ -25,6 +25,7 @@ int main(void) {
 #include <windows.h>
 #include <aclapi.h>
 #include <bcrypt.h>
+#include <sddl.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
 
@@ -32,6 +33,7 @@ int main(void) {
 #define PIPE_REJECT_REMOTE_CLIENTS 0x00000008
 #endif
 
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -80,9 +82,43 @@ static uint64_t launcher_filetime_value(const FILETIME *time) {
     return (uint64_t)time->dwLowDateTime | ((uint64_t)time->dwHighDateTime << 32U);
 }
 
+/* Last refusal detail, set at the exact check that failed and printed once by
+ * launcher_failure. A bare "policy is unsafe" is undiagnosable in the field;
+ * naming the object and rule costs nothing and leaks nothing an owner of the
+ * process could not query themselves. Last writer wins. */
+static wchar_t launcher_refusal_detail[320];
+
+static void launcher_refusal_set(const wchar_t *format, ...) {
+    va_list arguments;
+    va_start(arguments, format);
+    (void)_vsnwprintf(launcher_refusal_detail,
+                      sizeof(launcher_refusal_detail) / sizeof(wchar_t) - 1U, format, arguments);
+    va_end(arguments);
+    launcher_refusal_detail[sizeof(launcher_refusal_detail) / sizeof(wchar_t) - 1U] = L'\0';
+}
+
+static void launcher_refusal_set_sid(const wchar_t *what, PSID sid, DWORD rights) {
+    wchar_t *sid_text = NULL;
+    bool converted = sid && ConvertSidToStringSidW(sid, &sid_text) != 0;
+    if (rights) {
+        launcher_refusal_set(L"%ls %ls (rights 0x%08lx)", what,
+                             converted ? sid_text : L"<unreadable SID>", (unsigned long)rights);
+    } else {
+        launcher_refusal_set(L"%ls %ls", what, converted ? sid_text : L"<unreadable SID>");
+    }
+    if (converted) {
+        (void)LocalFree(sid_text);
+    }
+}
+
 static int launcher_failure(const wchar_t *message) {
     if (message) {
-        (void)fwprintf(stderr, L"codebase-memory-mcp: %ls\n", message);
+        if (launcher_refusal_detail[0]) {
+            (void)fwprintf(stderr, L"codebase-memory-mcp: %ls [%ls]\n", message,
+                           launcher_refusal_detail);
+        } else {
+            (void)fwprintf(stderr, L"codebase-memory-mcp: %ls\n", message);
+        }
         (void)fflush(stderr);
     }
     return 1;
@@ -96,11 +132,30 @@ static bool launcher_same_identity(const BY_HANDLE_FILE_INFORMATION *first,
 }
 
 static bool launcher_file_information(HANDLE file, BY_HANDLE_FILE_INFORMATION *information) {
-    return file && file != INVALID_HANDLE_VALUE && GetFileType(file) == FILE_TYPE_DISK &&
-           GetFileInformationByHandle(file, information) != 0 &&
-           (information->dwFileAttributes &
-            (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0 &&
-           information->nNumberOfLinks == 1U;
+    if (!file || file == INVALID_HANDLE_VALUE) {
+        launcher_refusal_set(L"open failed (error %lu)", (unsigned long)GetLastError());
+        return false;
+    }
+    if (GetFileType(file) != FILE_TYPE_DISK) {
+        launcher_refusal_set(L"not a local disk file");
+        return false;
+    }
+    if (GetFileInformationByHandle(file, information) == 0) {
+        launcher_refusal_set(L"attribute query failed (error %lu)", (unsigned long)GetLastError());
+        return false;
+    }
+    if ((information->dwFileAttributes &
+         (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
+        launcher_refusal_set(L"directory or reparse point (attributes 0x%08lx)",
+                             (unsigned long)information->dwFileAttributes);
+        return false;
+    }
+    if (information->nNumberOfLinks != 1U) {
+        launcher_refusal_set(L"hard-link count %lu, expected 1",
+                             (unsigned long)information->nNumberOfLinks);
+        return false;
+    }
+    return true;
 }
 
 static bool launcher_current_user(void **token_user_out, PSID *sid_out) {
@@ -180,6 +235,7 @@ static bool launcher_security_is_safe(HANDLE file, bool require_current_owner, D
     void *token_user = NULL;
     PSID user_sid = NULL;
     if (!launcher_current_user(&token_user, &user_sid)) {
+        launcher_refusal_set(L"could not resolve the process token user");
         return false;
     }
     PSID owner = NULL;
@@ -190,15 +246,25 @@ static bool launcher_security_is_safe(HANDLE file, bool require_current_owner, D
                                    NULL, &dacl, NULL, &descriptor);
     ACL_SIZE_INFORMATION information;
     memset(&information, 0, sizeof(information));
-    bool secure =
-        status == ERROR_SUCCESS && owner && IsValidSid(owner) &&
-        (require_current_owner ? EqualSid(owner, user_sid) != 0
-                               : launcher_sid_is_trusted(owner, user_sid)) &&
-        dacl && IsValidAcl(dacl) &&
-        GetAclInformation(dacl, &information, sizeof(information), AclSizeInformation) != 0;
+    bool secure = status == ERROR_SUCCESS && owner && IsValidSid(owner);
+    if (!secure) {
+        launcher_refusal_set(L"security query failed (status %lu)", (unsigned long)status);
+    } else if (require_current_owner ? EqualSid(owner, user_sid) == 0
+                                     : !launcher_sid_is_trusted(owner, user_sid)) {
+        launcher_refusal_set_sid(require_current_owner ? L"owner is not the current user:"
+                                                       : L"owner is not a trusted identity:",
+                                 owner, 0U);
+        secure = false;
+    } else if (!dacl || !IsValidAcl(dacl) ||
+               GetAclInformation(dacl, &information, sizeof(information), AclSizeInformation) ==
+                   0) {
+        launcher_refusal_set(L"missing or invalid DACL");
+        secure = false;
+    }
     for (DWORD index = 0; secure && index < information.AceCount; index++) {
         void *opaque = NULL;
         if (!GetAce(dacl, index, &opaque) || !opaque) {
+            launcher_refusal_set(L"DACL entry %lu is unreadable", (unsigned long)index);
             secure = false;
             break;
         }
@@ -218,6 +284,8 @@ static bool launcher_security_is_safe(HANDLE file, bool require_current_owner, D
         if (header->AceType != LAUNCHER_ACE_ALLOW ||
             header->AceSize <
                 offsetof(ACCESS_ALLOWED_ACE, SidStart) + offsetof(SID, SubAuthority)) {
+            launcher_refusal_set(L"DACL entry %lu has unsupported type 0x%02x",
+                                 (unsigned long)index, (unsigned int)header->AceType);
             secure = false;
             break;
         }
@@ -226,6 +294,8 @@ static bool launcher_security_is_safe(HANDLE file, bool require_current_owner, D
             continue;
         }
         if (!launcher_bounded_ace_sid_is_trusted(header, user_sid)) {
+            launcher_refusal_set_sid(L"mutation right granted to untrusted identity:",
+                                     (PSID)&ace->SidStart, ace->Mask & mutation);
             secure = false;
         }
     }
@@ -330,11 +400,25 @@ static bool launcher_path_tree_plain(const wchar_t *file_path) {
              * plant DLL or .exe.local redirection artifacts beside CBM. */
             mutation &= ~((DWORD)FILE_ADD_SUBDIRECTORY);
         }
+        DWORD open_error = component == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
         valid = component != INVALID_HANDLE_VALUE && GetFileType(component) == FILE_TYPE_DISK &&
                 GetFileInformationByHandle(component, &information) != 0 &&
                 (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
                 (information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
                 launcher_security_is_safe(component, false, mutation);
+        if (!valid) {
+            /* Name the ancestry component that failed while it is still
+             * NUL-terminated at this walk position. */
+            if (open_error != ERROR_SUCCESS) {
+                launcher_refusal_set(L"%ls: open failed (error %lu)", path,
+                                     (unsigned long)open_error);
+            } else {
+                wchar_t inner[320];
+                memcpy(inner, launcher_refusal_detail, sizeof(inner));
+                inner[sizeof(inner) / sizeof(wchar_t) - 1U] = L'\0';
+                launcher_refusal_set(L"%ls: %ls", path, inner);
+            }
+        }
         if (component != INVALID_HANDLE_VALUE)
             (void)CloseHandle(component);
         path[index] = saved;
