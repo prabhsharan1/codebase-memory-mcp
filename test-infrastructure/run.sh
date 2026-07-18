@@ -30,10 +30,30 @@
 #   ./test-infrastructure/run.sh lint         # clang-format + cppcheck
 #   ./test-infrastructure/run.sh shell        # debug shell
 
+# Runtime: any Docker-compatible daemon. On macOS we use Colima (free OSS):
+#   brew install colima docker docker-compose docker-buildx
+#   ln -sf /opt/homebrew/opt/docker-compose/bin/docker-compose ~/.docker/cli-plugins/docker-compose
+#   ln -sf /opt/homebrew/opt/docker-buildx/bin/docker-buildx  ~/.docker/cli-plugins/docker-buildx
+#   colima start --vm-type vz --vz-rosetta --cpu 12 --memory 16
+# --vz-rosetta is required for fast amd64 legs (QEMU otherwise). Autostart at
+# login: brew services start colima.
+
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 COMPOSE="docker compose -f $ROOT/test-infrastructure/docker-compose.yml"
+
+if ! docker info >/dev/null 2>&1; then
+    echo "ERROR: no Docker daemon reachable." >&2
+    echo "  Start one first — on macOS: colima start --vm-type vz --vz-rosetta --cpu 12 --memory 16" >&2
+    echo "  (current context: $(docker context show 2>/dev/null || echo unknown))" >&2
+    exit 1
+fi
+if ! docker compose version >/dev/null 2>&1; then
+    echo "ERROR: docker compose plugin missing." >&2
+    echo "  brew install docker-compose && ln -sf /opt/homebrew/opt/docker-compose/bin/docker-compose ~/.docker/cli-plugins/docker-compose" >&2
+    exit 1
+fi
 
 case "${1:-full}" in
     full)
