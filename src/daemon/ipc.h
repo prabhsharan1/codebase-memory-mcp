@@ -87,6 +87,11 @@ void cbm_daemon_ipc_listener_close(cbm_daemon_ipc_listener_t *listener);
  * cache root as well as daemon-private artifacts. */
 bool cbm_daemon_ipc_private_directory_secure(const char *directory_path);
 
+/* Human-readable reason for this process's most recent private-namespace
+ * validation refusal (empty string when none). Diagnostic only — callers
+ * append it to their error messages; policy decisions never read it. */
+const char *cbm_daemon_ipc_validation_detail(void);
+
 /* Create/validate an owner-only directory and securely open one regular
  * owner-only append log within it. User-controlled path components may not be
  * symlinks, junctions, or other reparse points; trusted root-owned macOS /tmp

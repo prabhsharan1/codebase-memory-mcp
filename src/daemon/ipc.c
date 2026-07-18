@@ -28,6 +28,23 @@ enum {
     CBM_DAEMON_IPC_WINDOWS_RENDEZVOUS_RETRY_MS = 250,
 };
 
+/* Last private-namespace validation refusal, set at the exact failing check.
+ * A bare "cache-private" status is undiagnosable in the field; the refusal
+ * names the object and rule instead. Last-writer-wins, diagnostic only. */
+static char ipc_validation_detail_buffer[384];
+
+static void ipc_validation_detail_set(const char *format, ...) {
+    va_list arguments;
+    va_start(arguments, format);
+    (void)vsnprintf(ipc_validation_detail_buffer, sizeof(ipc_validation_detail_buffer), format,
+                    arguments);
+    va_end(arguments);
+}
+
+const char *cbm_daemon_ipc_validation_detail(void) {
+    return ipc_validation_detail_buffer;
+}
+
 static bool instance_key_valid(const char *key) {
     if (!key) {
         return false;
@@ -1415,10 +1432,37 @@ static int private_directory_tree_open(const char *directory_path) {
         }
     }
     struct stat final_status;
-    ok = ok && visited && fstat(current_fd, &final_status) == 0 && S_ISDIR(final_status.st_mode) &&
-         final_status.st_uid == geteuid() && fchmod(current_fd, 0700) == 0 &&
-         cbm_macos_extended_acl_fd_clear(current_fd) && fstat(current_fd, &final_status) == 0 &&
-         (final_status.st_mode & 07777) == 0700 && cbm_macos_extended_acl_fd_is_empty(current_fd);
+    if (ok && !visited) {
+        ipc_validation_detail_set("%s: no path components resolved", directory_path);
+        ok = false;
+    }
+    if (ok && (fstat(current_fd, &final_status) != 0 || !S_ISDIR(final_status.st_mode))) {
+        ipc_validation_detail_set("%s: final stat failed or not a directory (errno %d)",
+                                  directory_path, errno);
+        ok = false;
+    }
+    if (ok && final_status.st_uid != geteuid()) {
+        ipc_validation_detail_set("%s: owner uid %ld, expected euid %ld", directory_path,
+                                  (long)final_status.st_uid, (long)geteuid());
+        ok = false;
+    }
+    if (ok && fchmod(current_fd, 0700) != 0) {
+        ipc_validation_detail_set("%s: chmod 0700 failed (errno %d)", directory_path, errno);
+        ok = false;
+    }
+    if (ok && !cbm_macos_extended_acl_fd_clear(current_fd)) {
+        ipc_validation_detail_set("%s: extended ACL not clearable", directory_path);
+        ok = false;
+    }
+    if (ok && (fstat(current_fd, &final_status) != 0 || (final_status.st_mode & 07777) != 0700)) {
+        ipc_validation_detail_set("%s: mode 0%o survived chmod, expected 0700", directory_path,
+                                  (unsigned)(final_status.st_mode & 07777));
+        ok = false;
+    }
+    if (ok && !cbm_macos_extended_acl_fd_is_empty(current_fd)) {
+        ipc_validation_detail_set("%s: extended ACL still present after clear", directory_path);
+        ok = false;
+    }
     free(path);
     if (!ok) {
         if (current_fd >= 0) {
@@ -1430,8 +1474,13 @@ static int private_directory_tree_open(const char *directory_path) {
 }
 
 bool cbm_daemon_ipc_private_directory_secure(const char *directory_path) {
+    ipc_validation_detail_set("%s", "");
     int directory_fd = private_directory_tree_open(directory_path);
     if (directory_fd < 0) {
+        if (!ipc_validation_detail_buffer[0]) {
+            ipc_validation_detail_set("%s: ancestry component validation failed (errno %d)",
+                                      directory_path, errno);
+        }
         return false;
     }
     return close(directory_fd) == 0;
@@ -3842,9 +3891,20 @@ static bool win_file_owner_secure(win_security_t *security, HANDLE file,
     PSECURITY_DESCRIPTOR descriptor = NULL;
     DWORD status = security->get_security_info(file, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
                                                &owner, NULL, NULL, NULL, &descriptor);
-    bool secure = status == ERROR_SUCCESS && owner && security->is_valid_sid(owner) &&
-                  (require_current_user ? security->equal_sid(owner, security->user_sid)
-                                        : win_sid_trusted(security, owner));
+    bool queried = status == ERROR_SUCCESS && owner && security->is_valid_sid(owner);
+    bool secure =
+        queried && (require_current_user ? security->equal_sid(owner, security->user_sid) != 0
+                                         : win_sid_trusted(security, owner));
+    if (!queried) {
+        ipc_validation_detail_set("owner query failed (status %lu)", (unsigned long)status);
+    } else if (!secure) {
+        const char *owner_class = security->is_well_known_sid(owner, WinLocalSystemSid) ? "SYSTEM"
+                                  : security->is_well_known_sid(owner, WinBuiltinAdministratorsSid)
+                                      ? "Administrators"
+                                      : "another account";
+        ipc_validation_detail_set("owner is %s, %s required", owner_class,
+                                  require_current_user ? "the exact user" : "a trusted identity");
+    }
     if (descriptor) {
         (void)LocalFree(descriptor);
     }
@@ -3899,6 +3959,9 @@ static bool win_file_acl_secure(win_security_t *security, HANDLE file, DWORD mut
         size_t sid_capacity = (size_t)header->AceSize - sid_offset;
         bool creator_owner_inherit_only = (header->AceFlags & INHERIT_ONLY_ACE) != 0U;
         if (!win_bounded_sid_trusted(security, sid, sid_capacity, creator_owner_inherit_only)) {
+            ipc_validation_detail_set(
+                "DACL entry %lu grants mutation rights 0x%08lx to an untrusted identity",
+                (unsigned long)index, (unsigned long)(ace->Mask & mutation));
             secure = false;
         }
     }
@@ -3967,6 +4030,11 @@ static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
             (owner_exact ? 0U : (DWORD)OWNER_SECURITY_INFORMATION) | DACL_SECURITY_INFORMATION |
                 PROTECTED_DACL_SECURITY_INFORMATION,
             owner_exact ? NULL : security.user_sid, NULL, security.acl, NULL);
+    }
+    if (valid_handle && owner_ok && secure_result != ERROR_SUCCESS) {
+        ipc_validation_detail_set("owner/DACL repair failed (status %lu%s)",
+                                  (unsigned long)secure_result,
+                                  can_write_owner ? "" : ", WRITE_OWNER unavailable");
     }
     bool final_private =
         secure_result == ERROR_SUCCESS &&
@@ -4055,6 +4123,16 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
              * win_runtime_directory_secure(), which may replace its DACL. */
             if (ok && i < length) {
                 ok = win_directory_component_secure(&security, path);
+                if (!ok) {
+                    /* Name the ancestry component while it is NUL-terminated
+                     * at this walk position; the helper set the inner rule. */
+                    char inner[384];
+                    (void)snprintf(inner, sizeof(inner), "%s", ipc_validation_detail_buffer);
+                    char *component_utf8 = wide_to_utf8(path);
+                    ipc_validation_detail_set(
+                        "%s: %s", component_utf8 ? component_utf8 : "<component>", inner);
+                    free(component_utf8);
+                }
             }
         }
         path[i] = saved;
@@ -4069,6 +4147,7 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
 }
 
 bool cbm_daemon_ipc_private_directory_secure(const char *directory_path) {
+    ipc_validation_detail_set("%s", "");
     if (!directory_path || !directory_path[0]) {
         return false;
     }
@@ -5142,6 +5221,7 @@ static bool win_pipe_server_is_current_user(HANDLE pipe) {
                : NULL;
     ULONG process_id = 0;
     if (!get_server_pid || !get_server_pid(pipe, &process_id) || process_id == 0) {
+        cbm_log_warn("daemon.client.server_identity", "step", "server_pid_query");
         return false;
     }
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
@@ -5149,6 +5229,14 @@ static bool win_pipe_server_is_current_user(HANDLE pipe) {
         process = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, process_id);
     }
     if (!process) {
+        /* A pipe whose server process cannot be opened is usually a dead
+         * server whose PID Windows already reaped or reused. */
+        char pid_text[16];
+        (void)snprintf(pid_text, sizeof(pid_text), "%lu", (unsigned long)process_id);
+        char error_text[16];
+        (void)snprintf(error_text, sizeof(error_text), "%lu", (unsigned long)GetLastError());
+        cbm_log_warn("daemon.client.server_identity", "step", "process_open", "pid", pid_text,
+                     "error", error_text);
         return false;
     }
     win_security_t security;

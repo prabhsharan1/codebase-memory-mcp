@@ -1538,10 +1538,12 @@ int main(int argc, char **argv) {
     }
     main_build_identity_status_t identity_status = main_build_identity(&identity);
     if (identity_status != MAIN_BUILD_IDENTITY_OK) {
+        const char *validation_detail = cbm_daemon_ipc_validation_detail();
         (void)fprintf(stderr,
                       "codebase-memory-mcp: exact executable identity could not be verified "
-                      "(%s)\n",
-                      main_build_identity_status_name(identity_status));
+                      "(%s)%s%s\n",
+                      main_build_identity_status_name(identity_status),
+                      validation_detail[0] ? " - " : "", validation_detail);
         return role == CBM_DAEMON_PROCESS_HOOK_CLIENT ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     cbm_http_server_set_binary_path(executable_path);
