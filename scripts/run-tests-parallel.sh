@@ -62,8 +62,17 @@ fi
 # when co-STARTED with a large wave on Apple Silicon (2s staggered vs ~230s
 # simultaneous — a local scheduler/zone quirk, not contention: job count
 # does not change it). Staggered in the tail they cost seconds.
+# The daemon-family suites spawn coordinated worker subprocesses (a re-exec
+# of this ASan runner plus the full admission handshake) and bind local
+# endpoints under fixed readiness deadlines (3 s marker waits in
+# index_supervisor); the saturated 3-core macOS CI runners starve those
+# deadlines into deterministic failures while an idle machine passes 6/6.
+# They also all rendezvous through the shared per-account runtime namespace,
+# which the quiet tail keeps free of cross-suite admission traffic.
 SERIAL_SUITES="cli subprocess watcher incremental httpd ui index_resilience mcp \
-    stack_overflow_a stack_overflow_b stack_overflow_c"
+    stack_overflow_a stack_overflow_b stack_overflow_c \
+    index_supervisor daemon_application daemon_runtime daemon_frontend \
+    daemon_bootstrap daemon_ipc"
 is_serial() {
     case " $SERIAL_SUITES " in *" $1 "*) return 0 ;; *) return 1 ;; esac
 }
