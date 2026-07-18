@@ -758,7 +758,7 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
         bool setup =
             endpoint && manager &&
             cbm_daemon_runtime_process_build_fingerprint((uint64_t)getpid(), fingerprint) &&
-            cbm_version_cohort_acquire(manager, &identity, cbm_now_ms() + 15000U, &lease,
+            cbm_version_cohort_acquire(manager, &identity, cbm_now_ms() + 45000U, &lease,
                                        &conflict) == CBM_VERSION_COHORT_OK &&
             cbm_daemon_ipc_startup_lock_try_acquire(endpoint, &startup) == 1 && startup;
         char ready = setup ? 'R' : 'E';

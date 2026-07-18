@@ -27,8 +27,8 @@ enum {
      * old 5 s/3 s deadlines. These are hang guards, not benchmarks: a
      * genuinely wedged worker still fails loudly here, and the failure
      * dumps the (empty) worker log as proof.  */
-    INDEX_SUPERVISOR_TEST_TERMINAL_MS = 20000,
-    INDEX_SUPERVISOR_TEST_READY_MS = 15000,
+    INDEX_SUPERVISOR_TEST_TERMINAL_MS = 90000,
+    INDEX_SUPERVISOR_TEST_READY_MS = 60000,
     INDEX_SUPERVISOR_TEST_BACKLOG_LINES = 1024,
 };
 

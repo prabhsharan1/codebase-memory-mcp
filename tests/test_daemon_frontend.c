@@ -68,13 +68,13 @@ enum {
     /* Hang guards, not benchmarks: starved 3-4-core CI runners need several
      * seconds for frontend/daemon startup paths that finish instantly on a
      * dev machine (see the index-supervisor calibration). */
-    FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS = 10000,
+    FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS = 30000,
     FRONTEND_EOF_TEST_CATASTROPHIC_TIMEOUT_S = 30,
     FRONTEND_BACKPRESSURE_MESSAGE_BYTES = 2 * 1024 * 1024,
     FRONTEND_BACKPRESSURE_FRONTEND_TIMEOUT_S = 12,
     FRONTEND_BACKPRESSURE_DAEMON_TIMEOUT_S = 20,
-    FRONTEND_BACKPRESSURE_RUNTIME_TIMEOUT_MS = 30000,
-    FRONTEND_BACKPRESSURE_CLEANUP_TIMEOUT_MS = 10000,
+    FRONTEND_BACKPRESSURE_RUNTIME_TIMEOUT_MS = 90000,
+    FRONTEND_BACKPRESSURE_CLEANUP_TIMEOUT_MS = 30000,
     /* The production queue is deliberately bounded below this count. Keep the
      * regression black-box: it must remain valid if the exact capacity changes
      * while still proving that overload cannot hide an already-pending EOF. */
