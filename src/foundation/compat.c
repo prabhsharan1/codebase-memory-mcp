@@ -129,8 +129,22 @@ char *cbm_mkdtemp(char *tmpl) {
     }
     if (!_mktemp(buf))
         return NULL;
-    if (!win_mkdtemp_private_create(buf) && _mkdir(buf) != 0)
-        return NULL;
+    if (!win_mkdtemp_private_create(buf)) {
+        /* One-time note: every private-namespace validation downstream
+         * depends on the explicit descriptor, so a silent fallback turns
+         * into unexplained owner/DACL refusals far from this call site. */
+        static bool fallback_reported;
+        DWORD create_error = GetLastError();
+        if (_mkdir(buf) != 0)
+            return NULL;
+        if (!fallback_reported) {
+            fallback_reported = true;
+            (void)fprintf(stderr,
+                          "warning: private temp-directory descriptor unavailable "
+                          "(os %lu); using default directory security\n",
+                          (unsigned long)create_error);
+        }
+    }
     /* Normalize to forward slashes. Callers embed this path in JSON repo_path
      * (where "\t"/"\a" are invalid escapes → index fails) and pass it to git -C.
      * Windows file APIs accept forward slashes, so the created dir is unaffected. */

@@ -9477,11 +9477,31 @@ static bool cli_windows_stage_private_file(
     cbm_activation_transaction_status_t status =
         cbm_activation_transaction_stage_file(target, source, &transaction);
     cli_binary_validator_t validator = {{0}};
-    bool ready = status == CBM_ACTIVATION_TRANSACTION_OK && transaction &&
-                 cli_activation_transaction_expected_build(transaction, &validator) &&
-                 cli_activation_transaction_commit_validated(transaction, &validator,
-                                                             CLI_OCTAL_PERM) == CLI_OK &&
-                 cli_activation_transaction_finalize_close(&transaction) == CLI_OK;
+    /* Each transaction step reports separately: a directory-validation
+     * refusal, a build-identity mismatch, and a commit failure are three
+     * different bugs, and the caller's single boolean previously collapsed
+     * them into one blind "staging failed" with no OS error code. */
+    bool ready = status == CBM_ACTIVATION_TRANSACTION_OK && transaction;
+    if (!ready) {
+        (void)fprintf(stderr, "error: staging transaction open failed (status %d, os %lu)\n",
+                      (int)status, (unsigned long)GetLastError());
+    }
+    if (ready && !cli_activation_transaction_expected_build(transaction, &validator)) {
+        (void)fprintf(stderr, "error: staged copy build-identity validation failed (os %lu)\n",
+                      (unsigned long)GetLastError());
+        ready = false;
+    }
+    if (ready && cli_activation_transaction_commit_validated(transaction, &validator,
+                                                             CLI_OCTAL_PERM) != CLI_OK) {
+        (void)fprintf(stderr, "error: staging transaction commit failed (os %lu)\n",
+                      (unsigned long)GetLastError());
+        ready = false;
+    }
+    if (ready && cli_activation_transaction_finalize_close(&transaction) != CLI_OK) {
+        (void)fprintf(stderr, "error: staging transaction finalize failed (os %lu)\n",
+                      (unsigned long)GetLastError());
+        ready = false;
+    }
     (void)cli_activation_transaction_abort(&transaction);
     if (ready && fingerprint_out) {
         (void)snprintf(fingerprint_out, CBM_DAEMON_BUILD_FINGERPRINT_SIZE, "%s",
@@ -9513,6 +9533,37 @@ static bool cli_windows_stage_private_bytes(
     return ready;
 }
 
+/* Per-user staging root for Windows install/update transactions. The
+ * activation transaction and the release-descriptor probe validate the FULL
+ * ancestor chain of everything they stage (trusted owner and no foreign
+ * mutation grant on any path component). The process temp root routinely
+ * fails that walk through no fault of ours: under msys2, TMP resolves
+ * inside the msys install tree (C:\msys64\tmp), and on GitHub runners
+ * inside the runner work directory, both of which carry broad inherited
+ * grants such as Authenticated Users modify on an upper component. The
+ * profile's AppData\Local chain is user-owned end to end, so staging there
+ * satisfies the strict walk by construction instead of by environment
+ * luck. */
+static const char *cli_windows_staging_root(char root_out[CLI_BUF_1K]) {
+    char base[CLI_BUF_1K];
+    if (!cbm_safe_getenv("LOCALAPPDATA", base, sizeof(base), NULL) || !base[0]) {
+        char profile[CLI_BUF_1K];
+        if (!cbm_safe_getenv("USERPROFILE", profile, sizeof(profile), NULL) || !profile[0]) {
+            return cbm_tmpdir();
+        }
+        int base_length = snprintf(base, sizeof(base), "%s/AppData/Local", profile);
+        if (base_length <= 0 || (size_t)base_length >= sizeof(base)) {
+            return cbm_tmpdir();
+        }
+    }
+    int written = snprintf(root_out, CLI_BUF_1K, "%s/codebase-memory-mcp", base);
+    if (written <= 0 || written >= CLI_BUF_1K) {
+        return cbm_tmpdir();
+    }
+    (void)_mkdir(root_out);
+    return root_out;
+}
+
 static bool cli_windows_prepare_install_pair(const wchar_t *launcher_source,
                                              const wchar_t *payload_source,
                                              const char expected_payload_sha256[65],
@@ -9521,8 +9572,9 @@ static bool cli_windows_prepare_install_pair(const wchar_t *launcher_source,
                                              char directory_out[CLI_BUF_1K]) {
     char *launcher_source_utf8 = cbm_wide_to_utf8(launcher_source);
     char *payload_source_utf8 = cbm_wide_to_utf8(payload_source);
-    int directory_length =
-        snprintf(directory_out, CLI_BUF_1K, "%s/cbm-win-install-XXXXXX", cbm_tmpdir());
+    char staging_root[CLI_BUF_1K];
+    int directory_length = snprintf(directory_out, CLI_BUF_1K, "%s/cbm-win-install-XXXXXX",
+                                    cli_windows_staging_root(staging_root));
     bool ready = launcher_source_utf8 && payload_source_utf8 && directory_length > 0 &&
                  directory_length < CLI_BUF_1K && cbm_mkdtemp(directory_out);
     char launcher_target[CLI_BUF_1K];
@@ -9622,8 +9674,9 @@ static bool cli_windows_prepare_update_pair(const cbm_windows_release_pair_t *pa
         pair->payload_len <= 0 || !expected_payload_sha256) {
         return false;
     }
-    int directory_length =
-        snprintf(directory_out, CLI_BUF_1K, "%s/cbm-win-update-XXXXXX", cbm_tmpdir());
+    char staging_root[CLI_BUF_1K];
+    int directory_length = snprintf(directory_out, CLI_BUF_1K, "%s/cbm-win-update-XXXXXX",
+                                    cli_windows_staging_root(staging_root));
     bool ready =
         directory_length > 0 && directory_length < CLI_BUF_1K && cbm_mkdtemp(directory_out);
     char launcher_target[CLI_BUF_1K];

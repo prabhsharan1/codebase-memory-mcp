@@ -61,7 +61,9 @@ sh)
     ;;
 push-file)
     [ $# -eq 2 ] || { echo "usage: win.sh push-file <local-path> <vm-path>" >&2; exit 2; }
-    scp -i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$1" "${USER_}@${HOST}:$2"
+    # Windows OpenSSH resolves scp targets natively: use C:/... not /c/...
+    dest="${2/#\/c\//C:\/}"
+    scp -i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$1" "${USER_}@${HOST}:${dest}"
     ;;
 asan-build)
     # x86_64 (CI's exact arch) with ASan, runs under Windows-on-ARM emulation.
