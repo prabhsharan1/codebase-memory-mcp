@@ -284,6 +284,17 @@ static bool activation_windows_security_init(activation_windows_security_t *secu
         SetEntriesInAclW(1, &access, NULL, &security->acl) == ERROR_SUCCESS &&
         InitializeSecurityDescriptor(&security->descriptor, SECURITY_DESCRIPTOR_REVISION) &&
         SetSecurityDescriptorDacl(&security->descriptor, TRUE, security->acl, FALSE) &&
+        /* Stamp the owner explicitly to the token user. Without this the file
+         * created with these attributes inherits the token's DEFAULT owner,
+         * which under an Administrators-default-owner policy (standard on
+         * Windows Server and GitHub's elevated runners) is BUILTIN\
+         * Administrators, not this user. Every staged file is then validated
+         * with a strict owner-is-current-user check (activation_windows_owner_
+         * is_current), so an unstamped file is rejected and private staging
+         * fails. The daemon stamps the owner identically for the same reason
+         * (see src/daemon/ipc.c). Setting the owner to our own token user
+         * needs no extra privilege. */
+        SetSecurityDescriptorOwner(&security->descriptor, security->user_sid, FALSE) &&
         SetSecurityDescriptorControl(&security->descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED);
     if (!ok) {
         if (security->acl) {
