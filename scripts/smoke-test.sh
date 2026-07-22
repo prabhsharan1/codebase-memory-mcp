@@ -3238,5 +3238,27 @@ fi
 wait "$SHUT_SRV_PID" 2>/dev/null || true
 echo "OK 16: stdio server terminated after stdin closed, no orphan"
 
+# The account daemon legitimately outlives its last client for a moment while
+# it drains, holding its log and config DB open. POSIX rm doesn't care, but on
+# Windows an open file blocks deletion — so a caller's cleanup rm of the smoke
+# cache races the daemon's asynchronous shutdown and fails with "Device or
+# resource busy". Retire the daemon deterministically through its own
+# lifecycle command and wait (bounded) until it reports not-running, then give
+# Windows one beat for the final handle close.
+"$BINARY" daemon stop >/dev/null 2>&1 || true
+DAEMON_GONE=0
+for _ in $(seq 1 100); do            # bounded ~20s (100 × 0.2s)
+  if ! "$BINARY" daemon status >/dev/null 2>&1; then DAEMON_GONE=1; break; fi
+  sleep 0.2
+done
+if [ "$DAEMON_GONE" -ne 1 ]; then
+  echo "FAIL 17: account daemon still active after daemon stop"
+  exit 1
+fi
+if [[ "$BINARY" == *.exe ]]; then
+  sleep 1
+fi
+echo "OK 17: account daemon retired; smoke cache is deletable"
+
 echo ""
 echo "=== smoke-test: ALL PASSED ==="
