@@ -1163,13 +1163,15 @@ static bool main_project_lock_manager_close(cbm_project_lock_manager_t **manager
 }
 
 static bool main_local_transition_close(cbm_daemon_ipc_local_transition_t **transition) {
-    bool ok = true;
     uint64_t deadline = main_deadline_after(MAIN_COORDINATION_CLEANUP_MS);
     while (transition && *transition) {
-        bool released = cbm_daemon_ipc_local_transition_release(transition);
-        if (!released) {
-            ok = false;
-        }
+        /* A failed release always RETAINS the transition and is retriable by
+         * contract: the Windows release transition must briefly try-hold the
+         * shared startup-v2/legacy gates, so concurrent one-shot teardowns
+         * legitimately collide and succeed on retry. Success consumes the
+         * transition; only never-finishing cleanup is a failure, and the
+         * deadline escalation below owns that. */
+        (void)cbm_daemon_ipc_local_transition_release(transition);
         if (*transition) {
             if (cbm_now_ms() >= deadline) {
                 main_coordination_cleanup_fail_stop("local_transition_cleanup");
@@ -1177,7 +1179,7 @@ static bool main_local_transition_close(cbm_daemon_ipc_local_transition_t **tran
             cbm_usleep(1000);
         }
     }
-    return ok;
+    return true;
 }
 
 static bool main_session_context(const char *preferred_root, char root_out[MAIN_PATH_CAP],
@@ -1517,16 +1519,20 @@ static void main_daemon_ctl_open_browser(int port) {
     char url[64];
     (void)snprintf(url, sizeof(url), "http://127.0.0.1:%d", port);
 #if defined(_WIN32)
-    char command[96];
-    (void)snprintf(command, sizeof(command), "start \"\" %s", url);
+    /* ShellExecuteW resolves the http protocol association directly — no
+     * command shell interprets the argument. Values > 32 signal success. */
+    wchar_t *wide_url = cbm_utf8_to_wide(url);
+    bool opened =
+        wide_url && (INT_PTR)ShellExecuteW(NULL, L"open", wide_url, NULL, NULL, SW_SHOWNORMAL) > 32;
+    free(wide_url);
 #elif defined(__APPLE__)
-    char command[96];
-    (void)snprintf(command, sizeof(command), "open %s", url);
+    const char *open_argv[] = {"open", url, NULL};
+    bool opened = cbm_exec_no_shell(open_argv) == 0;
 #else
-    char command[96];
-    (void)snprintf(command, sizeof(command), "xdg-open %s >/dev/null 2>&1", url);
+    const char *open_argv[] = {"xdg-open", url, NULL};
+    bool opened = cbm_exec_no_shell(open_argv) == 0;
 #endif
-    if (system(command) != 0) {
+    if (!opened) {
         (void)fprintf(stderr, "hint: could not open a browser automatically; visit %s\n", url);
     }
 }

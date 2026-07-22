@@ -1109,6 +1109,20 @@ path_match() {
   return 1
 }
 
+# A Windows path lands in a YAML/TOML config as a double-quoted scalar with
+# ESCAPED backslashes ("C:\\Users\\..."), so a raw grep for the msys-form
+# $SELF_PATH can never match it. Unquote, unescape, normalize separators,
+# then path_match.
+quoted_path_value_matches() {
+  local value="${1%$'\r'}"
+  local expected="$2"
+  value="${value#\"}"
+  value="${value%\"}"
+  value="${value//\\\\/\\}"
+  value="${value//\\//}"
+  [ -n "$value" ] && path_match "$value" "$expected"
+}
+
 json_instructions_contain_path() {
   local config="$1"
   local expected="$2"
@@ -1554,9 +1568,11 @@ fi
 echo "OK 8w-ii: Kiro MCP + steering + isolated exact-tool graph agent"
 
 # 8x: Hermes Agent YAML MCP mapping
+HERMES_CMD=$(sed -n '/^  codebase-memory-mcp:/{n;s/^ *command: *//p;}' \
+  "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null | head -1)
 if ! grep -q '^mcp_servers:' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null ||
    ! grep -q '^  codebase-memory-mcp:' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null ||
-   ! grep -Fq "$SELF_PATH" "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null; then
+   ! quoted_path_value_matches "$HERMES_CMD" "$SELF_PATH"; then
   echo "FAIL 8x: Hermes MCP mapping missing or malformed"
   exit 1
 fi
@@ -1728,9 +1744,11 @@ if [[ "$BINARY" == *.exe ]]; then
 else
   GOOSE_CFG="$FAKE_HOME/.config/goose/config.yaml"
 fi
+GOOSE_CMD=$(sed -n '/^  codebase-memory-mcp:/,/^  [^ ]/{s/^ *cmd: *//p;}' \
+  "$GOOSE_CFG" 2>/dev/null | head -1)
 if ! grep -q '^extensions:' "$GOOSE_CFG" 2>/dev/null ||
    ! grep -q '^  codebase-memory-mcp:' "$GOOSE_CFG" 2>/dev/null ||
-   ! grep -Fq "$SELF_PATH" "$GOOSE_CFG" 2>/dev/null; then
+   ! quoted_path_value_matches "$GOOSE_CMD" "$SELF_PATH"; then
   echo "FAIL 8ae: Goose extension missing or malformed"
   exit 1
 fi
@@ -1743,9 +1761,10 @@ fi
 echo "OK 8ae-i: Goose durable hints"
 
 # 8af: Mistral Vibe TOML array table
+VIBE_CMD=$(sed -n 's/^command *= *//p' "$FAKE_HOME/.vibe/config.toml" 2>/dev/null | head -1)
 if ! grep -q '^\[\[mcp_servers\]\]' "$FAKE_HOME/.vibe/config.toml" 2>/dev/null ||
    ! grep -q '^name = "codebase-memory-mcp"' "$FAKE_HOME/.vibe/config.toml" 2>/dev/null ||
-   ! grep -Fq "$SELF_PATH" "$FAKE_HOME/.vibe/config.toml" 2>/dev/null; then
+   ! quoted_path_value_matches "$VIBE_CMD" "$SELF_PATH"; then
   echo "FAIL 8af: Mistral Vibe MCP table missing or malformed"
   exit 1
 fi

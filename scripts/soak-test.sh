@@ -294,7 +294,12 @@ try:
     project = ""
     for item in content:
         if isinstance(item, dict) and item.get("type") == "text":
-            payload = json.loads(item.get("text", ""))
+            # The summary JSON may be preceded by plain-text banner items
+            # (update-available notice); skip anything that is not JSON.
+            try:
+                payload = json.loads(item.get("text", ""))
+            except ValueError:
+                continue
             candidate = payload.get("project") if isinstance(payload, dict) else None
             if isinstance(candidate, str) and candidate:
                 project = candidate
@@ -575,6 +580,32 @@ else
     echo "SKIP: idle daemon CPU is unavailable across the Windows PID boundary"
 fi
 
+# ── Phase 4b: one-shot CLI admission churn ───────────────────────
+# Every `cli` one-shot is a complete daemon client cycle (connect → commit →
+# execute → close-intent → drain) against the SAME daemon the metrics sampler
+# is watching. The long-lived MCP session above never exercises that path, so
+# a per-admission leak in the accept/worker-finish cycle would be invisible
+# without this churn — it lands in the same RSS/FD analysis below.
+
+echo "--- Phase 4b: CLI one-shot admission churn ---"
+CHURN_CYCLES=${SOAK_CLI_CHURN_CYCLES:-40}
+CHURN_FAILS=0
+churn_index=0
+while [ "$churn_index" -lt "$CHURN_CYCLES" ]; do
+    if ! CBM_CACHE_DIR="$SOAK_CACHE_DIR_VALUE" "$BINARY" cli list_projects '{}' \
+        >/dev/null 2>>"$RESULTS_DIR/cli-churn-stderr.log"; then
+        CHURN_FAILS=$((CHURN_FAILS + 1))
+    fi
+    churn_index=$((churn_index + 1))
+done
+if [ "$CHURN_FAILS" -gt 0 ]; then
+    echo "FAIL: $CHURN_FAILS of $CHURN_CYCLES one-shot CLI churn cycles failed"
+    PASS=false
+else
+    echo "OK: $CHURN_CYCLES one-shot CLI churn cycles recycled the live daemon"
+fi
+collect_snapshot
+
 # ── Phase 5: Crash recovery test ────────────────────────────────
 # Skipped in query-leak mode: crash recovery re-indexes (Phase 5 calls
 # index_repository), which triggers cbm_mem_collect and would mask the #581
@@ -705,7 +736,8 @@ fi
 
 # Check 3: Idle daemon CPU (where the PID is host-addressable)
 if [ -n "$IDLE_CPU" ]; then
-    IDLE_INT=$(echo "$IDLE_CPU" | cut -d. -f1)
+    # ps %cpu may carry a locale decimal comma; strip either separator.
+    IDLE_INT=$(echo "$IDLE_CPU" | cut -d. -f1 | cut -d, -f1)
     echo "Idle daemon CPU: ${IDLE_CPU}%" | tee -a "$SUMMARY"
     if [ "${IDLE_INT:-0}" -gt 5 ] 2>/dev/null; then
         echo "FAIL: idle daemon CPU ${IDLE_CPU}% > 5%" | tee -a "$SUMMARY"

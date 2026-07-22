@@ -8114,7 +8114,7 @@ static void cbm_agent_installed_binary_path(const char *home, char *binary_path,
                                             size_t binary_path_size) {
 #ifdef _WIN32
     char *managed = g_windows_launcher_context.present && g_windows_launcher_context.managed
-                        ? cbm_wide_to_utf8(g_windows_launcher_context.canonical_launcher_path)
+                        ? cli_windows_plain_utf8(g_windows_launcher_context.canonical_launcher_path)
                         : NULL;
     if (managed) {
         (void)snprintf(binary_path, binary_path_size, "%s", managed);
@@ -11631,11 +11631,10 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
                  AUGMENT_SESSION_SCRIPT);
         snprintf(coverage_hp, sizeof(coverage_hp), "%s/.augment/hooks/%s", home,
                  AUGMENT_COVERAGE_SCRIPT);
-#ifdef _WIN32
-        snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp.exe", home);
-#else
-        snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp", home);
-#endif
+        /* The owned-document match must rebuild the scripts with the exact
+         * binary path the install embedded — the managed canonical plain form
+         * on Windows, not a hand-assembled default. */
+        cbm_agent_installed_binary_path(home, binary_path, sizeof(binary_path));
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Augment/Auggie", cp, ip}, dry_run,
                                   cbm_remove_editor_mcp_owned);
         uninstall_tiered_agent_profiles(
@@ -12047,7 +12046,8 @@ static int cli_windows_managed_uninstall(const char *home, bool dry_run) {
             printf("Indexes kept.\n");
         }
     }
-    char *canonical_utf8 = cbm_wide_to_utf8(g_windows_launcher_context.canonical_launcher_path);
+    char *canonical_utf8 =
+        cli_windows_plain_utf8(g_windows_launcher_context.canonical_launcher_path);
     if (!canonical_utf8) {
         return CLI_TRUE;
     }
@@ -12368,8 +12368,9 @@ static int cli_windows_extract_and_activate_update(const char *archive_path, con
             g_windows_launcher_context.canonical_launcher_path, previous_launcher_backing,
             CBM_WINDOWS_LAUNCHER_PATH_CAP, backing_error, sizeof(backing_error));
     char *canonical_utf8 =
-        current_compatible ? cbm_wide_to_utf8(g_windows_launcher_context.canonical_launcher_path)
-                           : NULL;
+        current_compatible
+            ? cli_windows_plain_utf8(g_windows_launcher_context.canonical_launcher_path)
+            : NULL;
     if (!canonical_utf8) {
         cbm_windows_release_pair_free(&pair);
         (void)fprintf(stderr,
@@ -12979,7 +12980,8 @@ int cbm_cmd_update(int argc, char **argv) {
     if (dry_run) {
         printf("\n(dry-run — skipping download, extraction, and binary replacement)\n");
 #ifdef _WIN32
-        char *dry_run_target = cbm_wide_to_utf8(g_windows_launcher_context.canonical_launcher_path);
+        char *dry_run_target =
+            cli_windows_plain_utf8(g_windows_launcher_context.canonical_launcher_path);
         printf("  target: %s\n", dry_run_target ? dry_run_target : "(managed launcher)");
         free(dry_run_target);
 #else

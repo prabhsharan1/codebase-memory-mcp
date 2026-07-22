@@ -83,6 +83,16 @@ static uint64_t version_cohort_deadline_after(uint32_t timeout_ms) {
     return now > UINT64_MAX - timeout_ms ? UINT64_MAX : now + timeout_ms;
 }
 
+/* flock's LOCK_NB retries never queue in the kernel, so fairness comes only
+ * from the retry schedule. Two participants retrying with the SAME fixed
+ * period can phase-lock — every try landing inside the peer's brief hold
+ * window — starving an EX acquisition until one side's budget expires. A
+ * per-process, time-scattered jitter decorrelates the schedules. */
+static void version_cohort_retry_sleep(void) {
+    uint64_t mix = (cbm_now_ms() + version_cohort_current_pid()) * 2654435761ULL;
+    cbm_usleep(VERSION_COHORT_RETRY_US / 2U + (uint32_t)(mix % VERSION_COHORT_RETRY_US));
+}
+
 static cbm_private_file_lock_status_t version_cohort_lock_release_until(
     cbm_private_file_lock_t **lock_io, uint64_t deadline_ms) {
     cbm_private_file_lock_status_t result = CBM_PRIVATE_FILE_LOCK_OK;
@@ -100,7 +110,7 @@ static cbm_private_file_lock_status_t version_cohort_lock_release_until(
         if (cbm_now_ms() >= deadline_ms) {
             return result == CBM_PRIVATE_FILE_LOCK_OK ? CBM_PRIVATE_FILE_LOCK_IO : result;
         }
-        cbm_usleep(VERSION_COHORT_RETRY_US);
+        version_cohort_retry_sleep();
     }
     return result;
 }
@@ -132,7 +142,7 @@ static void version_cohort_startup_lock_release_complete(cbm_daemon_ipc_startup_
         if (cbm_now_ms() >= deadline) {
             version_cohort_cleanup_fail_stop("startup_lock_cleanup");
         }
-        cbm_usleep(VERSION_COHORT_RETRY_US);
+        version_cohort_retry_sleep();
     }
 }
 #endif
@@ -249,7 +259,7 @@ static cbm_private_file_lock_status_t version_cohort_lock_until(
             (deadline_ms != UINT64_MAX && cbm_now_ms() >= deadline_ms)) {
             return status;
         }
-        cbm_usleep(VERSION_COHORT_RETRY_US);
+        version_cohort_retry_sleep();
     }
 }
 

@@ -83,9 +83,12 @@ static bool origin_is_same_server(const char *origin, int port) {
 }
 
 static bool origin_matches_host(const char *origin, const char *host, int port) {
-    const char *hostname = strncmp(host, "localhost", 9) == 0 ? "localhost" : "127.0.0.1";
+    /* Two literal loopback forms only — spelled out so the static URL audit
+     * sees the complete URL each branch can produce. */
     char expected[128];
-    int length = snprintf(expected, sizeof(expected), "http://%s:%d", hostname, port);
+    int length = strncmp(host, "localhost", 9) == 0
+                     ? snprintf(expected, sizeof(expected), "http://localhost:%d", port)
+                     : snprintf(expected, sizeof(expected), "http://127.0.0.1:%d", port);
     return length > 0 && (size_t)length < sizeof(expected) && strcmp(origin, expected) == 0;
 }
 

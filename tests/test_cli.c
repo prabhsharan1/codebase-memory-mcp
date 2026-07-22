@@ -764,7 +764,14 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
         char ready = setup ? 'R' : 'E';
         (void)write(ready_pipe[1], &ready, 1);
         bool saw_maintenance = false;
-        uint64_t maintenance_deadline = cbm_now_ms() + 30000U;
+        /* The installer only reaches the cohort barrier after STAGING the
+         * candidate — three tamper-defense SHA-256 passes over the whole
+         * binary. The candidate here is this test runner itself (~1 GB with
+         * sanitizers), which costs ~40 s on container/CI I/O, so the
+         * observation window must cover worst-case staging. On success the
+         * child exits the moment it observes the request, so the fast path
+         * stays fast. */
+        uint64_t maintenance_deadline = cbm_now_ms() + 120000U;
         while (setup && cbm_now_ms() < maintenance_deadline) {
             cbm_version_cohort_maintenance_presence_t presence =
                 cbm_version_cohort_maintenance_presence(manager);
@@ -776,7 +783,12 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
                 presence == CBM_VERSION_COHORT_MAINTENANCE_IO) {
                 break;
             }
-            cbm_usleep(1000);
+            /* REQUESTED is level-triggered: the installer holds maintenance EX
+             * for the whole mutation window, which cannot complete before this
+             * child releases its lease. A realistic probe cadence therefore
+             * cannot miss it; a 1 kHz probe storm would only be an observer
+             * artifact no production participant produces. */
+            cbm_usleep(25000);
         }
         uint64_t bootstrap_stall_deadline = cbm_now_ms() + 3000U;
         while (saw_maintenance && cbm_now_ms() < bootstrap_stall_deadline) {
@@ -8390,6 +8402,14 @@ TEST(cli_installer_rejects_symlinked_agent_roots) {
     snprintf(junie_link, sizeof(junie_link), "%s/.junie", tmpdir);
     if (symlink(qoder_target, qoder_link) != 0 || symlink(junie_target, junie_link) != 0)
         FAIL("symlink failed");
+    /* Root-owned symlinks are deliberately trusted as infrastructure (distro
+     * /home indirection, macOS /tmp) — only root can create them, so they are
+     * outside the attacker model. The contract under test is refusal of
+     * USER-planted links; a root test run (containers) must demote its links
+     * to an unprivileged owner or it would assert against the wrong model. */
+    if (geteuid() == 0 &&
+        (lchown(qoder_link, 65534, 65534) != 0 || lchown(junie_link, 65534, 65534) != 0))
+        FAIL("lchown to unprivileged owner failed");
 
     char qoder_executable[512];
     snprintf(qoder_executable, sizeof(qoder_executable), "%s/qodercli", tmpdir);

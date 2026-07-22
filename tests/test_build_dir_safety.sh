@@ -33,31 +33,60 @@ for path in \
     fi
 done
 
+# Create a real directory link: a native symlink, or an NTFS junction on
+# Windows (MSYS reports junctions as symlinks).  MSYS2's default `ln -s`
+# silently DEEP-COPIES the target, which would turn these traversal fixtures
+# into vacuous copies that the validator rightly accepts.  Returns nonzero
+# when this environment cannot create a real link at all — the traversal
+# scenario then cannot exist, and the caller skips instead of asserting
+# against a copy.
+make_real_dir_link() {
+    local target="$1" link="$2"
+    if MSYS=winsymlinks:nativestrict ln -s -- "$target" "$link" 2>/dev/null &&
+        [ -L "$link" ]; then
+        return 0
+    fi
+    rm -rf -- "$link"
+    case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*)
+        cmd //c "mklink /J \"$(cygpath -w "$link")\" \"$(cygpath -w "$target")\"" \
+            >/dev/null 2>&1 || true
+        ;;
+    esac
+    [ -L "$link" ]
+}
+
 # Lexical containment is not enough: an attacker-controlled or accidental
 # build/ symlink would make ROOT/build/c traverse outside the repository.
 symlink_fixture="$(mktemp -d "${TMPDIR:-/tmp}/cbm-build-dir-symlink.XXXXXX")"
 trap 'rm -rf -- "$symlink_fixture"' EXIT
 mkdir -p "$symlink_fixture/repo" "$symlink_fixture/outside"
-ln -s "$symlink_fixture/outside" "$symlink_fixture/repo/build"
-if (
-    cd "$symlink_fixture/repo"
-    cbm_require_safe_build_dir build/c "$symlink_fixture/repo"
-); then
-    echo "FAIL: BUILD_DIR accepted a symlinked build/ ancestor" >&2
-    exit 1
+if make_real_dir_link "$symlink_fixture/outside" "$symlink_fixture/repo/build"; then
+    if (
+        cd "$symlink_fixture/repo"
+        cbm_require_safe_build_dir build/c "$symlink_fixture/repo"
+    ); then
+        echo "FAIL: BUILD_DIR accepted a symlinked build/ ancestor" >&2
+        exit 1
+    fi
+else
+    echo "SKIP: no real symlink/junction support here; ancestor-traversal fixture not exercisable"
 fi
 
 mkdir -p "$symlink_fixture/safe-repo/build" "$symlink_fixture/final-target"
 printf 'keep\n' >"$symlink_fixture/final-target/sentinel"
-ln -s "$symlink_fixture/final-target" "$symlink_fixture/safe-repo/build/c"
-if ! cbm_remove_build_dir "$symlink_fixture/safe-repo" build/c; then
-    echo "FAIL: safe removal rejected a final-component symlink" >&2
-    exit 1
-fi
-if [ -e "$symlink_fixture/safe-repo/build/c" ] ||
-    [ ! -f "$symlink_fixture/final-target/sentinel" ]; then
-    echo "FAIL: final-component symlink removal followed the link" >&2
-    exit 1
+if make_real_dir_link "$symlink_fixture/final-target" "$symlink_fixture/safe-repo/build/c"; then
+    if ! cbm_remove_build_dir "$symlink_fixture/safe-repo" build/c; then
+        echo "FAIL: safe removal rejected a final-component symlink" >&2
+        exit 1
+    fi
+    if [ -e "$symlink_fixture/safe-repo/build/c" ] ||
+        [ ! -f "$symlink_fixture/final-target/sentinel" ]; then
+        echo "FAIL: final-component symlink removal followed the link" >&2
+        exit 1
+    fi
+else
+    echo "SKIP: no real symlink/junction support here; final-component fixture not exercisable"
 fi
 mkdir -p "$symlink_fixture/safe-repo/build/ordinary"
 printf 'remove\n' >"$symlink_fixture/safe-repo/build/ordinary/artifact"
