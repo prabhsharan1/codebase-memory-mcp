@@ -55,6 +55,33 @@ copy_smoke_binary() {
   fi
 }
 
+# Retire the shared account daemon (if one is running) and wait until it
+# reports not-running. Install/uninstall flows leave an ephemeral daemon
+# draining asynchronously whose mapped generation backing and open logs
+# block rm on Windows (POSIX rm doesn't care) — so every cleanup of a
+# fixture HOME that received an install, and the final cache removal, must
+# retire it deterministically first. A daemon that will not retire is a
+# failure in its own right, never a tolerated race.
+retire_account_daemon() {
+  local label="$1"
+  if ! "$BINARY" daemon status >/dev/null 2>&1; then
+    return 0
+  fi
+  "$BINARY" daemon stop >/dev/null 2>&1 || true
+  local gone=0
+  for _ in $(seq 1 100); do            # bounded ~20s (100 x 0.2s)
+    if ! "$BINARY" daemon status >/dev/null 2>&1; then gone=1; break; fi
+    sleep 0.2
+  done
+  if [ "$gone" -ne 1 ]; then
+    echo "FAIL $label: account daemon still active after daemon stop"
+    exit 1
+  fi
+  if [[ "$BINARY" == *.exe ]]; then
+    sleep 1
+  fi
+}
+
 TMPDIR=$(smoke_mktemp_dir)
 DRYRUN_HOME=""
 # On MSYS2/Windows, convert POSIX path to native Windows path for the binary
@@ -2569,24 +2596,25 @@ echo "--- Phase 9b: adversarial install/uninstall tests ---"
 # completes without crash and prints "Detected agents:" line.
 EMPTY_HOME=$(smoke_mktemp_dir)
 mkdir -p "$EMPTY_HOME/.local/bin"
-INSTALL_OUT=$(HOME="$EMPTY_HOME" "$BINARY" install -y 2>&1) || true
+INSTALL_OUT=$(HOME="$EMPTY_HOME" LOCALAPPDATA="$EMPTY_HOME/AppData/Local" "$BINARY" install -y 2>&1) || true
 if ! echo "$INSTALL_OUT" | grep -qi 'detected agents'; then
   echo "FAIL 9b-1: install output missing 'Detected agents' line"
   exit 1
 fi
 echo "OK 9b-1: install with minimal agents exits cleanly"
+retire_account_daemon "9b-1-cleanup"
 rm -rf "$EMPTY_HOME"
 
 # 9b-2: Install twice (idempotent)
 IDEM_HOME=$(smoke_mktemp_dir)
 mkdir -p "$IDEM_HOME/.claude" "$IDEM_HOME/.local/bin"
 copy_smoke_binary "$IDEM_HOME/.local/bin/codebase-memory-mcp"
-HOME="$IDEM_HOME" "$BINARY" install -y 2>&1 > /dev/null || true
+HOME="$IDEM_HOME" LOCALAPPDATA="$IDEM_HOME/AppData/Local" "$BINARY" install -y 2>&1 > /dev/null || true
 IDEM_INSTALLER="$BINARY"
 if [[ "$BINARY" == *.exe ]]; then
   IDEM_INSTALLER="$IDEM_HOME/.local/bin/codebase-memory-mcp.exe"
 fi
-HOME="$IDEM_HOME" "$IDEM_INSTALLER" install -y 2>&1 > /dev/null || true
+HOME="$IDEM_HOME" LOCALAPPDATA="$IDEM_HOME/AppData/Local" "$IDEM_INSTALLER" install -y 2>&1 > /dev/null || true
 # Count MCP entries — should be exactly 1
 COUNT=$(cat "$IDEM_HOME/.claude.json" 2>/dev/null | python3 -c "
 import json, sys
@@ -2598,6 +2626,7 @@ if [ "$COUNT" != "1" ]; then
   exit 1
 fi
 echo "OK 9b-2: double install is idempotent"
+retire_account_daemon "9b-2-cleanup"
 rm -rf "$IDEM_HOME"
 
 # 9b-3: Uninstall without prior install
@@ -2605,6 +2634,7 @@ CLEAN_HOME=$(smoke_mktemp_dir)
 mkdir -p "$CLEAN_HOME/.claude" "$CLEAN_HOME/.local/bin"
 UNINSTALL_OUT=$(HOME="$CLEAN_HOME" "$BINARY" uninstall -y -n 2>&1) || true
 echo "OK 9b-3: uninstall without install doesn't crash"
+retire_account_daemon "9b-3-cleanup"
 rm -rf "$CLEAN_HOME"
 
 # 9b-4: Install over corrupt JSON
@@ -2615,6 +2645,7 @@ echo '{invalid json here' > "$CORRUPT_HOME/.claude.json"
 HOME="$CORRUPT_HOME" "$BINARY" install -y 2>&1 > /dev/null || true
 # Should either fix it or handle gracefully — not crash
 echo "OK 9b-4: install over corrupt JSON doesn't crash"
+retire_account_daemon "9b-4-cleanup"
 rm -rf "$CORRUPT_HOME"
 
 # 9b-8: Double uninstall
@@ -2629,6 +2660,7 @@ fi
 HOME="$DBL_HOME" "$DBL_UNINSTALLER" uninstall -y -n 2>&1 > /dev/null || true
 HOME="$DBL_HOME" "$BINARY" uninstall -y -n 2>&1 > /dev/null || true
 echo "OK 9b-8: double uninstall doesn't crash"
+retire_account_daemon "9b-8-cleanup"
 rm -rf "$DBL_HOME"
 
 # 9b-9: Non-interactive update without --standard/--ui should fail cleanly (not hang)
@@ -2642,6 +2674,7 @@ if [ "$(uname -s)" != "MINGW64_NT" ] 2>/dev/null; then
   fi
 fi
 
+retire_account_daemon "9-cleanup"
 rm -rf "$FAKE_HOME" "$EMPTY_HOME"
 
 if [ "$SMOKE_MODE" = "--agent-config-only" ]; then
@@ -3270,19 +3303,7 @@ echo "OK 16: stdio server terminated after stdin closed, no orphan"
 # resource busy". Retire the daemon deterministically through its own
 # lifecycle command and wait (bounded) until it reports not-running, then give
 # Windows one beat for the final handle close.
-"$BINARY" daemon stop >/dev/null 2>&1 || true
-DAEMON_GONE=0
-for _ in $(seq 1 100); do            # bounded ~20s (100 × 0.2s)
-  if ! "$BINARY" daemon status >/dev/null 2>&1; then DAEMON_GONE=1; break; fi
-  sleep 0.2
-done
-if [ "$DAEMON_GONE" -ne 1 ]; then
-  echo "FAIL 17: account daemon still active after daemon stop"
-  exit 1
-fi
-if [[ "$BINARY" == *.exe ]]; then
-  sleep 1
-fi
+retire_account_daemon 17
 echo "OK 17: account daemon retired; smoke cache is deletable"
 
 echo ""
